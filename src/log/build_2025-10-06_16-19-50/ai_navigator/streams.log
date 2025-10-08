@@ -1,0 +1,10 @@
+[0.633s] Invoking command in '/home/mcfb/ros2_ws/src/build/ai_navigator': DEBUGINFOD_URLS=https://debuginfod.ubuntu.com PYTHONPATH=/home/mcfb/ros2_ws/src/build/ai_navigator/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/mcfb/ros2_ws/src/build/ai_navigator/build --no-deps symlink_data
+[0.782s] /home/mcfb/drone_venv/lib/python3.12/site-packages/setuptools/_distutils/dist.py:289: UserWarning: Unknown distribution option: 'tests_require'
+[0.782s]   warnings.warn(msg)
+[0.834s] usage: setup.py [global_opts] cmd1 [cmd1_opts] [cmd2 [cmd2_opts] ...]
+[0.834s]    or: setup.py --help [cmd1 cmd2 ...]
+[0.834s]    or: setup.py --help-commands
+[0.834s]    or: setup.py cmd --help
+[0.834s] 
+[0.834s] error: option --editable not recognized
+[0.858s] Invoked command in '/home/mcfb/ros2_ws/src/build/ai_navigator' returned '1': DEBUGINFOD_URLS=https://debuginfod.ubuntu.com PYTHONPATH=/home/mcfb/ros2_ws/src/build/ai_navigator/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py develop --editable --build-directory /home/mcfb/ros2_ws/src/build/ai_navigator/build --no-deps symlink_data

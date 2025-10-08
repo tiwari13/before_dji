@@ -1,0 +1,57 @@
+[0.536s] Invoking command in '/home/mcfb/ros2_ws/src/ai_navigator': DEBUGINFOD_URLS=https://debuginfod.ubuntu.com PYTHONPATH=/home/mcfb/ros2_ws/build/ai_navigator/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/ai_navigator build --build-base /home/mcfb/ros2_ws/build/ai_navigator/build install --record /home/mcfb/ros2_ws/build/ai_navigator/install.log --single-version-externally-managed install_data
+[0.666s] /home/mcfb/drone_venv/lib/python3.12/site-packages/setuptools/_distutils/dist.py:289: UserWarning: Unknown distribution option: 'tests_require'
+[0.666s]   warnings.warn(msg)
+[0.760s] running egg_info
+[0.774s] creating ../../build/ai_navigator/ai_navigator.egg-info
+[0.774s] writing ../../build/ai_navigator/ai_navigator.egg-info/PKG-INFO
+[0.774s] writing dependency_links to ../../build/ai_navigator/ai_navigator.egg-info/dependency_links.txt
+[0.775s] writing entry points to ../../build/ai_navigator/ai_navigator.egg-info/entry_points.txt
+[0.775s] writing requirements to ../../build/ai_navigator/ai_navigator.egg-info/requires.txt
+[0.775s] writing top-level names to ../../build/ai_navigator/ai_navigator.egg-info/top_level.txt
+[0.775s] writing manifest file '../../build/ai_navigator/ai_navigator.egg-info/SOURCES.txt'
+[0.806s] reading manifest file '../../build/ai_navigator/ai_navigator.egg-info/SOURCES.txt'
+[0.806s] adding license file 'LICENSE'
+[0.806s] writing manifest file '../../build/ai_navigator/ai_navigator.egg-info/SOURCES.txt'
+[0.806s] running build
+[0.806s] running build_py
+[0.807s] creating /home/mcfb/ros2_ws/build/ai_navigator/build/lib/ai_navigator
+[0.807s] copying ai_navigator/drone_state.py -> /home/mcfb/ros2_ws/build/ai_navigator/build/lib/ai_navigator
+[0.807s] copying ai_navigator/navigation_params.py -> /home/mcfb/ros2_ws/build/ai_navigator/build/lib/ai_navigator
+[0.807s] copying ai_navigator/obstacle_data.py -> /home/mcfb/ros2_ws/build/ai_navigator/build/lib/ai_navigator
+[0.807s] copying ai_navigator/main.py -> /home/mcfb/ros2_ws/build/ai_navigator/build/lib/ai_navigator
+[0.807s] copying ai_navigator/__init__.py -> /home/mcfb/ros2_ws/build/ai_navigator/build/lib/ai_navigator
+[0.807s] copying ai_navigator/obstacles.py -> /home/mcfb/ros2_ws/build/ai_navigator/build/lib/ai_navigator
+[0.807s] copying ai_navigator/smart_navigator.py -> /home/mcfb/ros2_ws/build/ai_navigator/build/lib/ai_navigator
+[0.807s] copying ai_navigator/autonomous_navigation.py -> /home/mcfb/ros2_ws/build/ai_navigator/build/lib/ai_navigator
+[0.808s] copying ai_navigator/path_planner.py -> /home/mcfb/ros2_ws/build/ai_navigator/build/lib/ai_navigator
+[0.808s] running install
+[0.812s] running install_lib
+[0.826s] creating /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator
+[0.826s] copying /home/mcfb/ros2_ws/build/ai_navigator/build/lib/ai_navigator/drone_state.py -> /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator
+[0.827s] copying /home/mcfb/ros2_ws/build/ai_navigator/build/lib/ai_navigator/navigation_params.py -> /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator
+[0.827s] copying /home/mcfb/ros2_ws/build/ai_navigator/build/lib/ai_navigator/obstacle_data.py -> /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator
+[0.827s] copying /home/mcfb/ros2_ws/build/ai_navigator/build/lib/ai_navigator/main.py -> /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator
+[0.827s] copying /home/mcfb/ros2_ws/build/ai_navigator/build/lib/ai_navigator/__init__.py -> /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator
+[0.827s] copying /home/mcfb/ros2_ws/build/ai_navigator/build/lib/ai_navigator/obstacles.py -> /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator
+[0.827s] copying /home/mcfb/ros2_ws/build/ai_navigator/build/lib/ai_navigator/smart_navigator.py -> /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator
+[0.827s] copying /home/mcfb/ros2_ws/build/ai_navigator/build/lib/ai_navigator/autonomous_navigation.py -> /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator
+[0.827s] copying /home/mcfb/ros2_ws/build/ai_navigator/build/lib/ai_navigator/path_planner.py -> /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator
+[0.827s] byte-compiling /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator/drone_state.py to drone_state.cpython-312.pyc
+[0.828s] byte-compiling /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator/navigation_params.py to navigation_params.cpython-312.pyc
+[0.828s] byte-compiling /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator/obstacle_data.py to obstacle_data.cpython-312.pyc
+[0.829s] byte-compiling /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator/main.py to main.cpython-312.pyc
+[0.829s] byte-compiling /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator/__init__.py to __init__.cpython-312.pyc
+[0.829s] byte-compiling /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator/obstacles.py to obstacles.cpython-312.pyc
+[0.829s] byte-compiling /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator/smart_navigator.py to smart_navigator.cpython-312.pyc
+[0.834s] byte-compiling /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator/autonomous_navigation.py to autonomous_navigation.cpython-312.pyc
+[0.840s] byte-compiling /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator/path_planner.py to path_planner.cpython-312.pyc
+[0.842s] running install_data
+[0.842s] running install_egg_info
+[0.857s] Copying ../../build/ai_navigator/ai_navigator.egg-info to /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator-0.0.0-py3.12.egg-info
+[0.857s] running install_scripts
+[0.896s] Installing ai_camera_sub script to /home/mcfb/ros2_ws/install/ai_navigator/lib/ai_navigator
+[0.896s] Installing autonomous_navigation script to /home/mcfb/ros2_ws/install/ai_navigator/lib/ai_navigator
+[0.896s] Installing navigate_to_point script to /home/mcfb/ros2_ws/install/ai_navigator/lib/ai_navigator
+[0.896s] Installing point_to_point_nav script to /home/mcfb/ros2_ws/install/ai_navigator/lib/ai_navigator
+[0.896s] writing list of installed files to '/home/mcfb/ros2_ws/build/ai_navigator/install.log'
+[0.919s] Invoked command in '/home/mcfb/ros2_ws/src/ai_navigator' returned '0': DEBUGINFOD_URLS=https://debuginfod.ubuntu.com PYTHONPATH=/home/mcfb/ros2_ws/build/ai_navigator/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/ai_navigator build --build-base /home/mcfb/ros2_ws/build/ai_navigator/build install --record /home/mcfb/ros2_ws/build/ai_navigator/install.log --single-version-externally-managed install_data

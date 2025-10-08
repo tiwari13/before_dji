@@ -1,0 +1,58 @@
+/home/mcfb/drone_venv/lib/python3.12/site-packages/setuptools/_distutils/dist.py:289: UserWarning: Unknown distribution option: 'tests_require'
+  warnings.warn(msg)
+running egg_info
+creating ../build/ai_navigator/ai_navigator.egg-info
+writing ../build/ai_navigator/ai_navigator.egg-info/PKG-INFO
+writing dependency_links to ../build/ai_navigator/ai_navigator.egg-info/dependency_links.txt
+writing entry points to ../build/ai_navigator/ai_navigator.egg-info/entry_points.txt
+writing requirements to ../build/ai_navigator/ai_navigator.egg-info/requires.txt
+writing top-level names to ../build/ai_navigator/ai_navigator.egg-info/top_level.txt
+writing manifest file '../build/ai_navigator/ai_navigator.egg-info/SOURCES.txt'
+reading manifest file '../build/ai_navigator/ai_navigator.egg-info/SOURCES.txt'
+adding license file 'LICENSE'
+writing manifest file '../build/ai_navigator/ai_navigator.egg-info/SOURCES.txt'
+running build
+running build_py
+creating /home/mcfb/ros2_ws/src/build/ai_navigator/build/lib/ai_navigator
+copying ai_navigator/drone_state.py -> /home/mcfb/ros2_ws/src/build/ai_navigator/build/lib/ai_navigator
+copying ai_navigator/navigation_params.py -> /home/mcfb/ros2_ws/src/build/ai_navigator/build/lib/ai_navigator
+copying ai_navigator/obstacle_data.py -> /home/mcfb/ros2_ws/src/build/ai_navigator/build/lib/ai_navigator
+copying ai_navigator/main.py -> /home/mcfb/ros2_ws/src/build/ai_navigator/build/lib/ai_navigator
+copying ai_navigator/__init__.py -> /home/mcfb/ros2_ws/src/build/ai_navigator/build/lib/ai_navigator
+copying ai_navigator/obstacles.py -> /home/mcfb/ros2_ws/src/build/ai_navigator/build/lib/ai_navigator
+copying ai_navigator/smart_navigator.py -> /home/mcfb/ros2_ws/src/build/ai_navigator/build/lib/ai_navigator
+copying ai_navigator/autonomous_navigation.py -> /home/mcfb/ros2_ws/src/build/ai_navigator/build/lib/ai_navigator
+copying ai_navigator/path_planner.py -> /home/mcfb/ros2_ws/src/build/ai_navigator/build/lib/ai_navigator
+running install
+running install_lib
+creating /home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages/ai_navigator
+copying /home/mcfb/ros2_ws/src/build/ai_navigator/build/lib/ai_navigator/drone_state.py -> /home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages/ai_navigator
+copying /home/mcfb/ros2_ws/src/build/ai_navigator/build/lib/ai_navigator/navigation_params.py -> /home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages/ai_navigator
+copying /home/mcfb/ros2_ws/src/build/ai_navigator/build/lib/ai_navigator/obstacle_data.py -> /home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages/ai_navigator
+copying /home/mcfb/ros2_ws/src/build/ai_navigator/build/lib/ai_navigator/main.py -> /home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages/ai_navigator
+copying /home/mcfb/ros2_ws/src/build/ai_navigator/build/lib/ai_navigator/__init__.py -> /home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages/ai_navigator
+copying /home/mcfb/ros2_ws/src/build/ai_navigator/build/lib/ai_navigator/obstacles.py -> /home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages/ai_navigator
+copying /home/mcfb/ros2_ws/src/build/ai_navigator/build/lib/ai_navigator/smart_navigator.py -> /home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages/ai_navigator
+copying /home/mcfb/ros2_ws/src/build/ai_navigator/build/lib/ai_navigator/autonomous_navigation.py -> /home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages/ai_navigator
+copying /home/mcfb/ros2_ws/src/build/ai_navigator/build/lib/ai_navigator/path_planner.py -> /home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages/ai_navigator
+byte-compiling /home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages/ai_navigator/drone_state.py to drone_state.cpython-312.pyc
+byte-compiling /home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages/ai_navigator/navigation_params.py to navigation_params.cpython-312.pyc
+byte-compiling /home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages/ai_navigator/obstacle_data.py to obstacle_data.cpython-312.pyc
+byte-compiling /home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages/ai_navigator/main.py to main.cpython-312.pyc
+byte-compiling /home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages/ai_navigator/__init__.py to __init__.cpython-312.pyc
+byte-compiling /home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages/ai_navigator/obstacles.py to obstacles.cpython-312.pyc
+byte-compiling /home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages/ai_navigator/smart_navigator.py to smart_navigator.cpython-312.pyc
+byte-compiling /home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages/ai_navigator/autonomous_navigation.py to autonomous_navigation.cpython-312.pyc
+byte-compiling /home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages/ai_navigator/path_planner.py to path_planner.cpython-312.pyc
+running install_data
+creating /home/mcfb/ros2_ws/src/install/ai_navigator/share/ament_index/resource_index/packages
+copying resource/ai_navigator -> /home/mcfb/ros2_ws/src/install/ai_navigator/share/ament_index/resource_index/packages
+copying package.xml -> /home/mcfb/ros2_ws/src/install/ai_navigator/share/ai_navigator
+running install_egg_info
+Copying ../build/ai_navigator/ai_navigator.egg-info to /home/mcfb/ros2_ws/src/install/ai_navigator/lib/python3.12/site-packages/ai_navigator-0.0.0-py3.12.egg-info
+running install_scripts
+Installing ai_camera_sub script to /home/mcfb/ros2_ws/src/install/ai_navigator/lib/ai_navigator
+Installing autonomous_navigation script to /home/mcfb/ros2_ws/src/install/ai_navigator/lib/ai_navigator
+Installing navigate_to_point script to /home/mcfb/ros2_ws/src/install/ai_navigator/lib/ai_navigator
+Installing point_to_point_nav script to /home/mcfb/ros2_ws/src/install/ai_navigator/lib/ai_navigator
+writing list of installed files to '/home/mcfb/ros2_ws/src/build/ai_navigator/install.log'
