@@ -4,10 +4,10 @@
 
 #include <string.h>
 
-#include "px4_msgs/msg/detail/gpio_request__functions.h"
-#include "rosidl_typesupport_interface/macros.h"
 #include "px4_msgs/msg/detail/gpio_request__type_support.h"
+#include "px4_msgs/msg/detail/gpio_request__functions.h"
 #include "px4_msgs/msg/detail/gpio_request__struct.h"
+#include "rosidl_typesupport_interface/macros.h"
 
 #ifdef __cplusplus
 extern "C"

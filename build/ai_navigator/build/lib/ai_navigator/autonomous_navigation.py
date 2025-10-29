@@ -324,7 +324,7 @@ class SmartNavigator(Node):
 
     def _setup_subscribers(self):
         self.local_pos_sub = self.create_subscription(
-            VehicleLocalPosition, '/fmu/out/vehicle_local_position_v1', 
+            VehicleLocalPosition, '/fmu/out/vehicle_local_position', 
             self.position_callback, self.qos_profile)
         self.image_sub = self.create_subscription(
             Image, '/world/default/model/x500_depth_0/link/camera_link/sensor/IMX214/image', 
@@ -370,7 +370,6 @@ class SmartNavigator(Node):
     def position_callback(self, msg):
         self.current_position = [msg.x, msg.y, msg.z]
         self.last_position_update = time.time()
-        self.get_logger().info(f"Position update: x={msg.x:.2f}, y={msg.y:.2f}, z={msg.z:.2f}")
 
     def depth_callback(self, msg):
         try:

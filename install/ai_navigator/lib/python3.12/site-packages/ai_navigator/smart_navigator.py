@@ -98,6 +98,7 @@ class SmartNavigator(Node):
             self.state = DroneState.EMERGENCY
 
     def position_callback(self, msg):
+        self.get_logger().info("#######posotion callback loaded successfully")
         self.current_position = [msg.x, msg.y, msg.z]
         self.last_position_update = time.time()
 
@@ -109,6 +110,7 @@ class SmartNavigator(Node):
             self.get_logger().warn(f"Depth callback failed: {e}")
 
     def image_callback(self, msg):
+        self.get_logger().info("#######image callback loaded successfully")
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
             self.obstacle_info = self._process_frame_enhanced(frame)

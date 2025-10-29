@@ -6,8 +6,8 @@
 
 #include "px4_msgs/msg/detail/open_drone_id_system__functions.h"
 #include "px4_msgs/msg/detail/open_drone_id_system__struct.h"
-#include "rosidl_typesupport_interface/macros.h"
 #include "px4_msgs/msg/detail/open_drone_id_system__type_support.h"
+#include "rosidl_typesupport_interface/macros.h"
 
 #ifdef __cplusplus
 extern "C"
