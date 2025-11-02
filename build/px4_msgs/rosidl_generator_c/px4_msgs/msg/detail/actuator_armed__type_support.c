@@ -5,8 +5,8 @@
 #include <string.h>
 
 #include "px4_msgs/msg/detail/actuator_armed__functions.h"
-#include "px4_msgs/msg/detail/actuator_armed__type_support.h"
 #include "rosidl_typesupport_interface/macros.h"
+#include "px4_msgs/msg/detail/actuator_armed__type_support.h"
 #include "px4_msgs/msg/detail/actuator_armed__struct.h"
 
 #ifdef __cplusplus

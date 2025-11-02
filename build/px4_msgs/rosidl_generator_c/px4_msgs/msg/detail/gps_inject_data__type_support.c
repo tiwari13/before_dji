@@ -4,9 +4,9 @@
 
 #include <string.h>
 
-#include "px4_msgs/msg/detail/gps_inject_data__type_support.h"
 #include "px4_msgs/msg/detail/gps_inject_data__struct.h"
 #include "rosidl_typesupport_interface/macros.h"
+#include "px4_msgs/msg/detail/gps_inject_data__type_support.h"
 #include "px4_msgs/msg/detail/gps_inject_data__functions.h"
 
 #ifdef __cplusplus

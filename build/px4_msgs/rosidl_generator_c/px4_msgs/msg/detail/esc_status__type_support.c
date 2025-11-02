@@ -6,8 +6,8 @@
 
 #include "px4_msgs/msg/detail/esc_status__functions.h"
 #include "px4_msgs/msg/detail/esc_status__struct.h"
-#include "px4_msgs/msg/detail/esc_status__type_support.h"
 #include "rosidl_typesupport_interface/macros.h"
+#include "px4_msgs/msg/detail/esc_status__type_support.h"
 
 #ifdef __cplusplus
 extern "C"

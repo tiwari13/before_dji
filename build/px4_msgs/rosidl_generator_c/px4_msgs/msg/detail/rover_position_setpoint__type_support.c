@@ -4,10 +4,10 @@
 
 #include <string.h>
 
-#include "px4_msgs/msg/detail/rover_position_setpoint__type_support.h"
-#include "px4_msgs/msg/detail/rover_position_setpoint__functions.h"
 #include "px4_msgs/msg/detail/rover_position_setpoint__struct.h"
 #include "rosidl_typesupport_interface/macros.h"
+#include "px4_msgs/msg/detail/rover_position_setpoint__type_support.h"
+#include "px4_msgs/msg/detail/rover_position_setpoint__functions.h"
 
 #ifdef __cplusplus
 extern "C"

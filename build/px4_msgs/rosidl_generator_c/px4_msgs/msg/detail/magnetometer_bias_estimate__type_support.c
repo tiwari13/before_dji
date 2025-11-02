@@ -4,8 +4,8 @@
 
 #include <string.h>
 
-#include "px4_msgs/msg/detail/magnetometer_bias_estimate__struct.h"
 #include "px4_msgs/msg/detail/magnetometer_bias_estimate__functions.h"
+#include "px4_msgs/msg/detail/magnetometer_bias_estimate__struct.h"
 #include "rosidl_typesupport_interface/macros.h"
 #include "px4_msgs/msg/detail/magnetometer_bias_estimate__type_support.h"
 

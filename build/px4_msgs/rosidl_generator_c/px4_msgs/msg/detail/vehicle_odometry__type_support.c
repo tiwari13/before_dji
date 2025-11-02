@@ -5,9 +5,9 @@
 #include <string.h>
 
 #include "px4_msgs/msg/detail/vehicle_odometry__struct.h"
+#include "rosidl_typesupport_interface/macros.h"
 #include "px4_msgs/msg/detail/vehicle_odometry__functions.h"
 #include "px4_msgs/msg/detail/vehicle_odometry__type_support.h"
-#include "rosidl_typesupport_interface/macros.h"
 
 #ifdef __cplusplus
 extern "C"

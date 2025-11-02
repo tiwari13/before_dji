@@ -5,9 +5,9 @@
 #include <string.h>
 
 #include "px4_msgs/msg/detail/airspeed_wind__struct.h"
-#include "px4_msgs/msg/detail/airspeed_wind__functions.h"
 #include "rosidl_typesupport_interface/macros.h"
 #include "px4_msgs/msg/detail/airspeed_wind__type_support.h"
+#include "px4_msgs/msg/detail/airspeed_wind__functions.h"
 
 #ifdef __cplusplus
 extern "C"

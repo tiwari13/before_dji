@@ -1,0 +1,28 @@
+[0.627s] Invoking command in '/home/mcfb/ros2_ws/src/ai_navigator': DEBUGINFOD_URLS=https://debuginfod.ubuntu.com PYTHONPATH=/home/mcfb/ros2_ws/build/ai_navigator/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/ai_navigator build --build-base /home/mcfb/ros2_ws/build/ai_navigator/build install --record /home/mcfb/ros2_ws/build/ai_navigator/install.log --single-version-externally-managed install_data
+[0.880s] running egg_info
+[0.901s] writing ../../build/ai_navigator/ai_navigator.egg-info/PKG-INFO
+[0.902s] writing dependency_links to ../../build/ai_navigator/ai_navigator.egg-info/dependency_links.txt
+[0.902s] writing entry points to ../../build/ai_navigator/ai_navigator.egg-info/entry_points.txt
+[0.902s] writing requirements to ../../build/ai_navigator/ai_navigator.egg-info/requires.txt
+[0.902s] writing top-level names to ../../build/ai_navigator/ai_navigator.egg-info/top_level.txt
+[0.945s] reading manifest file '../../build/ai_navigator/ai_navigator.egg-info/SOURCES.txt'
+[0.945s] adding license file 'LICENSE'
+[0.946s] writing manifest file '../../build/ai_navigator/ai_navigator.egg-info/SOURCES.txt'
+[0.946s] running build
+[0.947s] running build_py
+[0.947s] copying ai_navigator/smart_navigator.py -> /home/mcfb/ros2_ws/build/ai_navigator/build/lib/ai_navigator
+[0.947s] running install
+[0.951s] running install_lib
+[0.971s] running install_data
+[0.971s] copying resource/ai_navigator -> /home/mcfb/ros2_ws/install/ai_navigator/share/ament_index/resource_index/packages
+[0.971s] copying package.xml -> /home/mcfb/ros2_ws/install/ai_navigator/share/ai_navigator
+[0.972s] running install_egg_info
+[0.990s] removing '/home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator-0.0.0-py3.12.egg-info' (and everything under it)
+[0.991s] Copying ../../build/ai_navigator/ai_navigator.egg-info to /home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages/ai_navigator-0.0.0-py3.12.egg-info
+[0.991s] running install_scripts
+[1.028s] Installing ai_camera_sub script to /home/mcfb/ros2_ws/install/ai_navigator/lib/ai_navigator
+[1.028s] Installing autonomous_navigation script to /home/mcfb/ros2_ws/install/ai_navigator/lib/ai_navigator
+[1.028s] Installing navigate_to_point script to /home/mcfb/ros2_ws/install/ai_navigator/lib/ai_navigator
+[1.028s] Installing point_to_point_nav script to /home/mcfb/ros2_ws/install/ai_navigator/lib/ai_navigator
+[1.029s] writing list of installed files to '/home/mcfb/ros2_ws/build/ai_navigator/install.log'
+[1.055s] Invoked command in '/home/mcfb/ros2_ws/src/ai_navigator' returned '0': DEBUGINFOD_URLS=https://debuginfod.ubuntu.com PYTHONPATH=/home/mcfb/ros2_ws/build/ai_navigator/prefix_override:/usr/lib/python3/dist-packages/colcon_core/task/python/colcon_distutils_commands:/home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages:${PYTHONPATH} /usr/bin/python3 -W ignore:setup.py install is deprecated -W ignore:easy_install command is deprecated setup.py egg_info --egg-base ../../build/ai_navigator build --build-base /home/mcfb/ros2_ws/build/ai_navigator/build install --record /home/mcfb/ros2_ws/build/ai_navigator/install.log --single-version-externally-managed install_data

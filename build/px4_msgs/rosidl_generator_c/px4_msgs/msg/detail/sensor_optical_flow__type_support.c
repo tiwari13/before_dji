@@ -4,8 +4,8 @@
 
 #include <string.h>
 
-#include "px4_msgs/msg/detail/sensor_optical_flow__struct.h"
 #include "px4_msgs/msg/detail/sensor_optical_flow__functions.h"
+#include "px4_msgs/msg/detail/sensor_optical_flow__struct.h"
 #include "px4_msgs/msg/detail/sensor_optical_flow__type_support.h"
 #include "rosidl_typesupport_interface/macros.h"
 
