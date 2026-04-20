@@ -2,6 +2,7 @@ import numpy as np
 import math
 import heapq
 import random
+from scipy.ndimage import distance_transform_edt
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple, Set
 from collections import deque

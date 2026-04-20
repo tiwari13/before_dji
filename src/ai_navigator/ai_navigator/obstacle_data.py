@@ -181,6 +181,8 @@ class ObstacleCluster:
     danger_level: int = 0
     world_x: float = 0.0
     world_y: float = 0.0
+    # YOLO detection class id (COCO: 0=person, 2=car, …)
+    object_class: int = -1
     
     def __post_init__(self):
         """Initialize derived properties"""

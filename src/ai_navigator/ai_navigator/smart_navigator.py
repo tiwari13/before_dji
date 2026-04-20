@@ -773,13 +773,18 @@ class SmartNavigator(Node):
             self.distance_sensor_callback, self.sensor_qos)
         
         # Vision and perception
+        # RGB camera from x500_depth model (bridged by PX4 automatically)
         self.image_sub = self.create_subscription(
-            ROSImage, '/world/default/model/x500_depth_0/link/camera_link/sensor/IMX214/image',
+            ROSImage, '/camera/image',
             self.image_callback, self.sensor_qos)
+
+        # Depth camera (requires manual bridge - see launch instructions)
         self.depth_sub = self.create_subscription(
             ROSImage, '/depth_camera', self.depth_callback, self.sensor_qos)
+
+        # LIDAR (requires manual bridge - see launch instructions)
         self.pointcloud_sub = self.create_subscription(
-            PointCloud2, '/lidar_points', self.lidar_callback, self.sensor_qos)
+            PointCloud2, '/lidar', self.lidar_callback, self.sensor_qos)
     
     def _initialize_enhanced_state(self):
         """Initialize enhanced state variables"""
@@ -864,6 +869,13 @@ class SmartNavigator(Node):
         self.sensor_data.position = Vector3D(msg.x, msg.y, msg.z)
         self.sensor_data.velocity = Vector3D(msg.vx, msg.vy, msg.vz)
         self.sensor_data.timestamp = time.time()
+
+        # B5 fix: record home position once in local NED metric frame
+        if self.home_position.x == 0.0 and self.home_position.y == 0.0:
+            self.home_position = Vector3D(msg.x, msg.y, msg.z)
+            self.get_logger().info(
+                f"Home position set: ({msg.x:.2f}, {msg.y:.2f}, {msg.z:.2f}) NED"
+            )
         
         # Update Kalman filter prediction
         dt = time.time() - self.last_control_update
@@ -883,15 +895,27 @@ class SmartNavigator(Node):
     
     def gps_callback(self, msg):
         """GPS data callback"""
-        # Convert GPS to local coordinates (simplified)
-        if not self.home_position.x and not self.home_position.y:
-            self.home_position = Vector3D(msg.latitude_deg, msg.longitude_deg, msg.altitude_msl_m)
-        
-        # Update GPS sensor data
-        self.sensor_data.gps_position = Vector3D(
-            (msg.latitude_deg - self.home_position.x) * 111320,  # Rough lat to meters
-            (msg.longitude_deg - self.home_position.y) * 111320 * math.cos(math.radians(msg.latitude_deg)),
-            msg.altitude_msl_m - self.home_position.z
+        # Update GPS sensor data using local NED position from VehicleLocalPosition,
+        # not raw GPS lat/lon. Home position is set once from the first local position
+        # reading in position_callback so it is already in metric NED frame.
+
+        # Convert GPS to local NED for Kalman filter (rough approximation only —
+        # primary position source is VehicleLocalPosition, not this).
+        if hasattr(self, '_home_gps_lat'):
+            lat0, lon0, alt0 = self._home_gps_lat, self._home_gps_lon, self._home_gps_alt
+        else:
+            lat0 = msg.latitude_deg
+            lon0 = msg.longitude_deg
+            alt0 = msg.altitude_msl_m
+            self._home_gps_lat = lat0
+            self._home_gps_lon = lon0
+            self._home_gps_alt = alt0
+
+        north = (msg.latitude_deg - lat0) * 111320.0
+        east  = (msg.longitude_deg - lon0) * 111320.0 * math.cos(math.radians(lat0))
+        down  = -(msg.altitude_msl_m - alt0)
+
+        self.sensor_data.gps_position = Vector3D(north, east, down
         )
         self.sensor_data.gps_accuracy = msg.eph
         self.sensor_data.satellites_used = msg.satellites_used
@@ -911,8 +935,16 @@ class SmartNavigator(Node):
         self.kalman_filter.update_imu(self.sensor_data.imu_acceleration)
     
     def attitude_callback(self, msg):
-        """Attitude callback"""
-        self.sensor_data.attitude = Vector3D(msg.q[0], msg.q[1], msg.q[2])  # Quaternion
+        """Attitude callback — store full quaternion [w, x, y, z]"""
+        # msg.q = [w, x, y, z]
+        self.sensor_data.attitude = Vector3D(msg.q[1], msg.q[2], msg.q[3])  # x, y, z
+        self.sensor_data._q_w = msg.q[0]                                     # w component
+
+        # B6 fix: extract yaw from quaternion for use in hover/navigation
+        from scipy.spatial.transform import Rotation as R
+        rot = R.from_quat([msg.q[1], msg.q[2], msg.q[3], msg.q[0]])  # [x,y,z,w]
+        roll, pitch, yaw = rot.as_euler('xyz', degrees=False)
+        self.sensor_data._current_yaw = yaw
     
     def angular_velocity_callback(self, msg):
         """Angular velocity callback"""
@@ -955,6 +987,38 @@ class SmartNavigator(Node):
                 self.processing_queues['lidar'].put(msg)
         except Exception as e:
             self.get_logger().warn(f"LIDAR callback failed: {e}")
+
+    def lidar_down_callback(self, msg):
+        """Downward LIDAR callback for ground distance measurement"""
+        try:
+            # Extract ground distance from downward LIDAR
+            # The downward LIDAR provides a single range measurement
+            # We'll extract the minimum distance as ground distance
+            import struct
+
+            # PointCloud2 structure: fields contain x, y, z data
+            # For a single-point LIDAR, we just need to extract the distance
+            if msg.width > 0 and msg.height > 0:
+                # Simple extraction - assumes first point contains distance in z
+                point_step = msg.point_step
+                if len(msg.data) >= point_step:
+                    # Extract x, y, z from first point (assuming float32 format)
+                    x = struct.unpack('f', msg.data[0:4])[0]
+                    y = struct.unpack('f', msg.data[4:8])[0]
+                    z = struct.unpack('f', msg.data[8:12])[0]
+
+                    # Calculate distance (Euclidean)
+                    distance = math.sqrt(x*x + y*y + z*z)
+
+                    # Update sensor data
+                    self.sensor_data.ground_distance = distance
+                    self.terrain_follow.ground_distance = distance
+
+                    # Also update terrain height estimate
+                    self.sensor_data.terrain_height = self.fused_position.z + distance
+
+        except Exception as e:
+            self.get_logger().debug(f"Downward LIDAR callback failed: {e}")
     
     def _vision_processing_loop(self):
         """Asynchronous vision processing thread"""
@@ -1106,13 +1170,14 @@ class SmartNavigator(Node):
             self._handle_precision_landing_state(dt)
         elif self.state == DroneState.EMERGENCY:
             self._handle_emergency_state()
-        # Add new states for advanced modes
-        elif self.state.value == "RTH":  # Return to Home
+        elif self.state == DroneState.RTH:
             self._handle_rth_state(dt)
-        elif self.state.value == "ACTIVETRACK":
+        elif self.state == DroneState.ACTIVETRACK:
             self._handle_activetrack_state(dt)
-        elif self.state.value == "TERRAIN_FOLLOW":
+        elif self.state == DroneState.TERRAIN_FOLLOW:
             self._handle_terrain_follow_state(dt)
+        elif self.state == DroneState.GPS_DENIED:
+            self._handle_gps_denied_state(dt)
     
     def _handle_enhanced_move_state(self, dt: float):
         """Enhanced movement with trajectory following"""
@@ -1209,8 +1274,8 @@ class SmartNavigator(Node):
     
     def _execute_precision_hover(self, target_pos: Vector3D, target_yaw: float, dt: float):
         """Execute precision hovering control"""
-        # Get current attitude (simplified - assume we have yaw)
-        current_yaw = 0.0  # Would extract from quaternion
+        # Get current yaw extracted from attitude quaternion in attitude_callback
+        current_yaw = getattr(self.sensor_data, '_current_yaw', 0.0)
         
         # Compute precision control
         control_acc, yaw_rate, precision_achieved = self.precision_hover.compute_control(
@@ -1438,12 +1503,26 @@ class SmartNavigator(Node):
     def _handle_emergency_state(self):
         """Enhanced emergency handling"""
         self.get_logger().error("EMERGENCY STATE - Executing emergency landing")
-        
+
         # Emergency landing with maximum safety
         self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_NAV_LAND)
-        
+
         # Log emergency details
         self.get_logger().error(f"Emergency triggered by: {self.safety_violations}")
+
+    def _handle_gps_denied_state(self, dt: float):
+        """GPS-denied navigation: rely on VIO, loiter if VIO also lost"""
+        if self.sensor_data.vision_confidence > 0.5:
+            # VIO healthy — continue to destination at reduced speed
+            self.get_logger().warn("GPS denied, navigating on VIO only")
+            self._fly_to_position(self.destination_point, dt)
+        else:
+            # Both GPS and VIO unavailable — hold altitude, zero horizontal velocity
+            self.get_logger().error("GPS and VIO both unavailable — holding altitude")
+            hold_pos = Vector3D(self.fused_position.x,
+                                self.fused_position.y,
+                                self.fused_position.z)
+            self.publish_setpoint(hold_pos.x, hold_pos.y, hold_pos.z, 0.0)
     
     # Enhanced vision processing
     def _process_frame_enhanced(self, frame: np.ndarray) -> ObstacleInfo:
@@ -1512,24 +1591,52 @@ class SmartNavigator(Node):
         return obstacle_info
     
     def _pixel_to_world_coordinates(self, px: int, py: int, depth: float) -> Vector3D:
-        """Convert pixel coordinates to world coordinates"""
-        frame_width = 640  # Assume camera width
-        frame_height = 480  # Assume camera height
-        
-        # Convert pixel coordinates to angles
-        angle_x = ((px - frame_width / 2) / frame_width) * self.nav_params.camera_fov_horizontal
-        angle_y = ((py - frame_height / 2) / frame_height) * self.nav_params.camera_fov_vertical
-        
-        # Convert to relative coordinates
-        rel_x = depth * math.tan(angle_x)
-        rel_y = depth * math.tan(angle_y)
-        rel_z = 0.0  # Assume object at same altitude
-        
-        # Transform to world coordinates (add drone position)
-        world_x = self.fused_position.x + rel_x
-        world_y = self.fused_position.y + rel_y
-        world_z = self.fused_position.z + rel_z
-        
+        """Convert pixel coordinates to world coordinates.
+
+        Pipeline:
+          pixel → normalised camera ray → rotate by drone attitude → scale by depth → add position
+        """
+        # Camera intrinsics (OakD-Lite at 640×480, scaled from Module 1 calibration)
+        fx = 465.74
+        fy = 465.74
+        cx_cam = 320.0
+        cy_cam = 240.0
+
+        # Back-project pixel to unit ray in camera frame (x-right, y-down, z-forward)
+        ray_cam = np.array([
+            (px - cx_cam) / fx,
+            (py - cy_cam) / fy,
+            1.0
+        ])
+        ray_cam = ray_cam / np.linalg.norm(ray_cam)
+
+        # Get drone attitude quaternion [w, x, y, z] from sensor data.
+        # sensor_data.attitude stores the raw quaternion components from VehicleAttitude.
+        q = self.sensor_data.attitude  # Vector3D used as storage: x=q[0], y=q[1], z=q[2]
+        # VehicleAttitude.q is [w, x, y, z] — we stored q[0..2] in Vector3D x/y/z.
+        # Retrieve the full quaternion; w is stored separately if available.
+        q_w = getattr(self.sensor_data, '_q_w', 1.0)
+        q_vec = np.array([q_w, q.x, q.y, q.z])  # [w, x, y, z]
+
+        # Build rotation matrix from body to world (NED) using scipy
+        from scipy.spatial.transform import Rotation as R
+        # scipy expects [x, y, z, w]
+        rot = R.from_quat([q_vec[1], q_vec[2], q_vec[3], q_vec[0]])
+        R_body_world = rot.as_matrix()
+
+        # Camera is assumed forward-facing, body-aligned (no separate extrinsic rotation).
+        # In NED: camera z-forward maps to body x-forward.
+        # Simple remapping: cam_x→body_y, cam_y→body_z, cam_z→body_x
+        ray_body = np.array([ray_cam[2], ray_cam[0], ray_cam[1]])
+
+        # Rotate to world frame
+        ray_world = R_body_world @ ray_body
+
+        # Scale by metric depth and add drone position
+        world_x = self.fused_position.x + ray_world[0] * depth
+        world_y = self.fused_position.y + ray_world[1] * depth
+        world_z = self.fused_position.z + ray_world[2] * depth
+
         return Vector3D(world_x, world_y, world_z)
     
     def _create_enhanced_obstacle_clusters(self, detections: List[dict], 
@@ -1603,6 +1710,10 @@ class SmartNavigator(Node):
         else:
             threat_level = ThreatLevel.MEDIUM
         
+        # Use the most common YOLO class across merged detections
+        class_ids = [det['cls'] for det in detections if 'cls' in det]
+        dominant_class = max(set(class_ids), key=class_ids.count) if class_ids else -1
+
         # Create cluster
         cluster = ObstacleCluster(
             cluster_id=0,  # Will be assigned by tracker
@@ -1611,7 +1722,8 @@ class SmartNavigator(Node):
             confidence=sum(det['conf'] for det in detections) / len(detections),
             size_estimate=dimensions.magnitude(),
             threat_level=threat_level,
-            
+            object_class=dominant_class,
+
             # Legacy compatibility
             center_x=world_x,
             center_y=world_y,
@@ -1636,7 +1748,7 @@ class SmartNavigator(Node):
         
         for cluster in obstacle_info.clusters:
             # Filter for person-like objects (class 0 in COCO is person)
-            if hasattr(cluster, 'object_class') and cluster.object_class == 0:
+            if cluster.object_class == 0:
                 detection = {
                     'world_x': cluster.world_x,
                     'world_y': cluster.world_y,
