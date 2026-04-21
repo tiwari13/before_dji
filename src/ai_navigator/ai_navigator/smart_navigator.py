@@ -16,8 +16,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from px4_msgs.msg import (OffboardControlMode, TrajectorySetpoint, VehicleCommand, 
                          VehicleLocalPosition, SensorGps, VehicleImu, 
                          VehicleAttitude, VehicleAngularVelocity, DistanceSensor)
-from sensor_msgs.msg import Image as ROSImage, PointCloud2, NavSatFix, Imu
-from geometry_msgs.msg import TwistStamped, PoseStamped
+from sensor_msgs.msg import Image as ROSImage, PointCloud2
+from nav_msgs.msg import Odometry
 from std_msgs.msg import Float32MultiArray
 
 # Computer vision and AI
@@ -41,38 +41,65 @@ from ai_navigator.drone_state import DroneState
 
 @dataclass
 class SensorData:
-    """Consolidated sensor data structure"""
-    # Position and orientation
+    """Consolidated sensor data.
+
+    Navigation frame convention (used throughout this node):
+      LOCAL NED — matches PX4 VehicleLocalPosition output:
+        +x = North  (meters)
+        +y = East   (meters)
+        +z = Down   (meters, negative = above ground)
+      All positions, velocities, and obstacle coordinates MUST be in this frame
+      before being stored here or passed to the planner.
+      GPS and VIO measurements are converted to NED on ingestion.
+
+    Body frame: x-forward, y-right, z-down  (PX4 convention).
+    Camera frame: z-forward, x-right, y-down (standard pinhole).
+    """
+    # PX4 local NED position/velocity — primary nav source
     position: Vector3D = field(default_factory=Vector3D)
     velocity: Vector3D = field(default_factory=Vector3D)
     acceleration: Vector3D = field(default_factory=Vector3D)
-    attitude: Vector3D = field(default_factory=Vector3D)  # roll, pitch, yaw
     angular_velocity: Vector3D = field(default_factory=Vector3D)
-    
-    # GPS data
+
+    # Attitude stored as full quaternion (w, x, y, z) — PX4 VehicleAttitude.q order
+    attitude_quaternion: Tuple[float, float, float, float] = field(
+        default_factory=lambda: (1.0, 0.0, 0.0, 0.0))
+    # Yaw derived from attitude_quaternion in attitude_callback; 0=North, +ve=clockwise (NED)
+    yaw: float = 0.0
+
+    # GPS data (converted to local NED before storage)
     gps_position: Vector3D = field(default_factory=Vector3D)
     gps_velocity: Vector3D = field(default_factory=Vector3D)
     gps_accuracy: float = 999.0
     satellites_used: int = 0
     gps_fix_type: int = 0
-    
+
     # IMU data
     imu_acceleration: Vector3D = field(default_factory=Vector3D)
     imu_angular_velocity: Vector3D = field(default_factory=Vector3D)
-    imu_orientation: Vector3D = field(default_factory=Vector3D)
-    
-    # Vision data
-    vision_position: Vector3D = field(default_factory=Vector3D)
-    vision_velocity: Vector3D = field(default_factory=Vector3D)
-    vision_confidence: float = 0.0
-    
+
+    # VIO odometry — from step9_msckf or step10_multicam_msckf (local NED)
+    vio_position: Vector3D = field(default_factory=Vector3D)
+    vio_velocity: Vector3D = field(default_factory=Vector3D)
+    vio_confidence: float = 0.0
+
     # Environmental sensors
     barometric_altitude: float = 0.0
     ground_distance: float = 0.0
     terrain_height: float = 0.0
-    
-    # Health indicators
-    timestamp: float = field(default_factory=time.time)
+
+    # Per-source timestamps for independent health checking
+    timestamp: float = field(default_factory=time.time)       # generic last-update
+    local_pose_timestamp: float = 0.0   # last VehicleLocalPosition msg
+    vio_timestamp: float = 0.0          # last MSCKF pose msg
+    gps_timestamp: float = 0.0          # last SensorGps msg
+    perception_timestamp: float = 0.0  # last vision frame processed
+
+    # Source validity flags — gated in safety_check, not just by confidence scalar
+    local_pose_valid: bool = False
+    gps_valid: bool = False
+    vio_valid: bool = False
+
     sensor_health: Dict[str, float] = field(default_factory=dict)
 
 class KalmanFilter:
@@ -785,6 +812,27 @@ class SmartNavigator(Node):
         # LIDAR (requires manual bridge - see launch instructions)
         self.pointcloud_sub = self.create_subscription(
             PointCloud2, '/lidar', self.lidar_callback, self.sensor_qos)
+
+        # VIO odometry — step9_msckf publishes nav_msgs/Odometry on /msckf_vio/odometry
+        # step10_multicam_msckf publishes on /multicam_msckf/odometry
+        # The ROS parameter 'vio_topic' selects which to use (default: msckf mono)
+        vio_topic = self.declare_parameter('vio_topic', '/msckf_vio/odometry').value
+        self.vio_sub = self.create_subscription(
+            Odometry, vio_topic,
+            self.vio_callback, self.sensor_qos)
+        self.get_logger().info(f"VIO subscriber: {vio_topic}")
+
+        # Primary pose source — set via ROS parameter at launch time:
+        #   px4_local  : use PX4 EKF2 VehicleLocalPosition (safe default)
+        #   msckf      : use step9 MSCKF odometry on vio_topic
+        # Example: ros2 run ai_navigator smart_navigator --ros-args -p primary_pose_source:=msckf
+        self.primary_pose_source = self.declare_parameter(
+            'primary_pose_source', 'px4_local').value
+        self.get_logger().info(f"Primary pose source: {self.primary_pose_source}")
+
+        # VIO freshness timeout — separate from GPS timeout because VIO runs at ~30 Hz
+        # and should be declared stale much faster than a 1–5 Hz GPS signal.
+        self.vio_timeout = self.declare_parameter('vio_timeout', 1.0).value
     
     def _initialize_enhanced_state(self):
         """Initialize enhanced state variables"""
@@ -798,7 +846,8 @@ class SmartNavigator(Node):
         self.destination_point = Vector3D(0.0, self.nav_params.destination_offset, 
                                         self.nav_params.takeoff_altitude)
         self.home_position = Vector3D()
-        
+        self.home_position_initialized = False  # set True once first local pose arrives
+
         # Current trajectory
         self.current_trajectory: Optional[Trajectory] = None
         self.trajectory_index = 0
@@ -865,33 +914,39 @@ class SmartNavigator(Node):
     # Callback methods for sensor data
     def position_callback(self, msg):
         """Enhanced position callback with sensor fusion"""
-        self.get_logger().info("###########position callback called yet#############")
         self.sensor_data.position = Vector3D(msg.x, msg.y, msg.z)
         self.sensor_data.velocity = Vector3D(msg.vx, msg.vy, msg.vz)
-        self.sensor_data.timestamp = time.time()
+        now = time.time()
+        self.sensor_data.timestamp = now
+        self.sensor_data.local_pose_timestamp = now
+        self.sensor_data.local_pose_valid = True
 
-        # B5 fix: record home position once in local NED metric frame
-        if self.home_position.x == 0.0 and self.home_position.y == 0.0:
+        # Record home position once from first valid local NED reading
+        if not self.home_position_initialized:
             self.home_position = Vector3D(msg.x, msg.y, msg.z)
+            self.home_position_initialized = True
             self.get_logger().info(
                 f"Home position set: ({msg.x:.2f}, {msg.y:.2f}, {msg.z:.2f}) NED"
             )
         
-        # Update Kalman filter prediction
-        dt = time.time() - self.last_control_update
-        if dt > 0:
-            self.kalman_filter.predict(dt)
-        
-        # Vision-based position update (if available)
-        if self.sensor_data.vision_confidence > 0.5:
-            self.kalman_filter.update_vision(
-                self.sensor_data.vision_position,
-                self.sensor_data.vision_confidence
-            )
-        
-        # Update fused position
-        self.fused_position = self.kalman_filter.get_position()
-        self.fused_velocity = self.kalman_filter.get_velocity()
+        # Update fused position based on authoritative source
+        if self.primary_pose_source == 'msckf' and self.sensor_data.vio_valid:
+            # VIO is primary — both position and velocity come from vio_callback
+            # Nothing to do here; vio_callback already updated fused_position/velocity
+            pass
+        else:
+            # px4_local is primary — use PX4 EKF2 position directly
+            self.fused_position = self.sensor_data.position
+            self.fused_velocity = self.sensor_data.velocity
+            # Also feed Kalman filter as secondary smoother
+            dt = time.time() - self.last_control_update
+            if dt > 0:
+                self.kalman_filter.predict(dt)
+            if self.sensor_data.vio_valid:
+                self.kalman_filter.update_vision(
+                    self.sensor_data.vio_position,
+                    self.sensor_data.vio_confidence
+                )
     
     def gps_callback(self, msg):
         """GPS data callback"""
@@ -919,9 +974,14 @@ class SmartNavigator(Node):
         )
         self.sensor_data.gps_accuracy = msg.eph
         self.sensor_data.satellites_used = msg.satellites_used
-        
-        # Update Kalman filter with GPS
-        if msg.satellites_used >= self.nav_params.sensor_fusion.gps_min_satellites:
+        self.sensor_data.gps_timestamp = time.time()
+        self.sensor_data.gps_valid = (
+            msg.satellites_used >= self.nav_params.sensor_fusion.gps_min_satellites
+            and msg.eph < self.nav_params.sensor_fusion.gps_hdop_threshold
+        )
+
+        # Feed Kalman filter secondary smoother with GPS
+        if self.sensor_data.gps_valid:
             self.kalman_filter.update_gps(self.sensor_data.gps_position, msg.eph)
     
     def imu_callback(self, msg):
@@ -935,21 +995,55 @@ class SmartNavigator(Node):
         self.kalman_filter.update_imu(self.sensor_data.imu_acceleration)
     
     def attitude_callback(self, msg):
-        """Attitude callback — store full quaternion [w, x, y, z]"""
-        # msg.q = [w, x, y, z]
-        self.sensor_data.attitude = Vector3D(msg.q[1], msg.q[2], msg.q[3])  # x, y, z
-        self.sensor_data._q_w = msg.q[0]                                     # w component
+        """Store full attitude quaternion and derive yaw.
 
-        # B6 fix: extract yaw from quaternion for use in hover/navigation
+        PX4 VehicleAttitude.q = [w, x, y, z].
+        """
         from scipy.spatial.transform import Rotation as R
-        rot = R.from_quat([msg.q[1], msg.q[2], msg.q[3], msg.q[0]])  # [x,y,z,w]
-        roll, pitch, yaw = rot.as_euler('xyz', degrees=False)
-        self.sensor_data._current_yaw = yaw
+        w, x, y, z = msg.q[0], msg.q[1], msg.q[2], msg.q[3]
+        self.sensor_data.attitude_quaternion = (w, x, y, z)
+        # scipy expects [x, y, z, w]
+        rot = R.from_quat([x, y, z, w])
+        # ZYX Euler in NED: yaw is rotation about z-down axis
+        _, _, yaw = rot.as_euler('xyz', degrees=False)
+        self.sensor_data.yaw = yaw
     
     def angular_velocity_callback(self, msg):
         """Angular velocity callback"""
         self.sensor_data.angular_velocity = Vector3D(msg.xyz[0], msg.xyz[1], msg.xyz[2])
     
+    def vio_callback(self, msg: Odometry):
+        """MSCKF VIO odometry callback — reads pose AND twist from nav_msgs/Odometry.
+
+        step9_msckf publishes on /msckf_vio/odometry (Odometry, frame: world/imu).
+        Position/velocity are in the same local frame as VehicleLocalPosition
+        (gravity-bug fixed in commit a4a62f2 — NED-aligned at rest).
+
+        Confidence is estimated from position covariance trace: low trace → high conf.
+        """
+        now = time.time()
+
+        # Pose
+        p = msg.pose.pose.position
+        self.sensor_data.vio_position = Vector3D(p.x, p.y, p.z)
+
+        # Twist (linear velocity in the odometry child frame)
+        v = msg.twist.twist.linear
+        self.sensor_data.vio_velocity = Vector3D(v.x, v.y, v.z)
+
+        # Confidence from position covariance trace (lower = more confident)
+        cov_trace = msg.pose.covariance[0] + msg.pose.covariance[7] + msg.pose.covariance[14]
+        # Map: trace 0→conf 1.0, trace 10→conf 0.0, clamp to [0,1]
+        self.sensor_data.vio_confidence = max(0.0, min(1.0, 1.0 - cov_trace / 10.0))
+
+        self.sensor_data.vio_timestamp = now
+        self.sensor_data.vio_valid = self.sensor_data.vio_confidence > 0.3
+
+        # If VIO is the primary source, update fused pose + velocity immediately
+        if self.primary_pose_source == 'msckf' and self.sensor_data.vio_valid:
+            self.fused_position = self.sensor_data.vio_position
+            self.fused_velocity = self.sensor_data.vio_velocity
+
     def distance_sensor_callback(self, msg):
         """Distance sensor callback"""
         if msg.orientation == 8:  # Downward facing
@@ -957,7 +1051,6 @@ class SmartNavigator(Node):
             self.terrain_follow.ground_distance = msg.current_distance
     
     def image_callback(self, msg):
-        self.get_logger().info("###########imgae callback called #############")
         """Enhanced image processing callback"""
         try:
             frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -970,7 +1063,6 @@ class SmartNavigator(Node):
             self.get_logger().error(f"Image processing failed: {e}")
     
     def depth_callback(self, msg):
-        self.get_logger().info("###########Depth callback called #############")
         """Depth camera callback"""
         try:
             depth_image = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
@@ -1028,9 +1120,10 @@ class SmartNavigator(Node):
                 
                 # Process frame for obstacles and tracking
                 obstacle_info = self._process_frame_enhanced(frame)
-                
-                # Update obstacle tracker
+
+                # Update obstacle tracker and stamp perception health
                 self.obstacle_info = obstacle_info
+                self.sensor_data.perception_timestamp = time.time()
                 
                 # ActiveTrack processing
                 if self.flight_mode == FlightMode.ACTIVETRACK:
@@ -1125,32 +1218,65 @@ class SmartNavigator(Node):
             self.get_logger().error(f"Control loop error: {e}")
             self.state = DroneState.EMERGENCY
     
+    # States in which a GPS loss should trigger GPS_DENIED navigation
+    _GPS_DENIED_ELIGIBLE = frozenset({
+        DroneState.MOVE, DroneState.AVOIDING, DroneState.RETREATING,
+        DroneState.CIRCLING, DroneState.HOLD,
+    })
+
     def _enhanced_safety_check(self) -> bool:
-        """Enhanced safety checking system"""
-        current_time = time.time()
-        
-        # Check sensor timeouts
-        if current_time - self.sensor_data.timestamp > self.nav_params.safety.gps_timeout:
-            self.get_logger().error("Position data timeout - entering emergency mode")
+        """Per-source health checks with graduated degradation."""
+        now = time.time()
+
+        # --- Local pose timeout → emergency (no position at all)
+        if (self.sensor_data.local_pose_valid and
+                now - self.sensor_data.local_pose_timestamp > self.nav_params.safety.gps_timeout):
+            self.sensor_data.local_pose_valid = False
+            self.get_logger().error("Local pose timeout — EMERGENCY")
             self.state = DroneState.EMERGENCY
             return False
-        
-        # Check immediate collision threats
-        if (self.obstacle_info.detected and 
-            self.obstacle_info.max_threat_level >= ThreatLevel.EMERGENCY):
+
+        # --- GPS timeout → mark invalid; transition to GPS_DENIED if actively flying
+        if (self.sensor_data.gps_valid and
+                now - self.sensor_data.gps_timestamp > self.nav_params.safety.gps_timeout):
+            self.sensor_data.gps_valid = False
+            self.get_logger().warn("GPS timeout — GPS source marked invalid")
+            if self.state in self._GPS_DENIED_ELIGIBLE:
+                self.get_logger().warn("Entering GPS_DENIED state — navigating on VIO/EKF")
+                self.state = DroneState.GPS_DENIED
+
+        # --- VIO timeout → mark invalid (planning continues on px4_local)
+        if (self.sensor_data.vio_valid and
+                now - self.sensor_data.vio_timestamp > self.vio_timeout):
+            self.sensor_data.vio_valid = False
+            if self.primary_pose_source == 'msckf':
+                self.primary_pose_source = 'px4_local'
+                self.get_logger().warn("VIO timeout — falling back to px4_local")
+
+        # --- Perception timeout → clear stale obstacles
+        if (self.sensor_data.perception_timestamp > 0 and
+                now - self.sensor_data.perception_timestamp > 2.0):
+            self.obstacle_info = ObstacleInfo()
+            self.get_logger().warn("Perception timeout — obstacle map cleared")
+
+        # --- Emergency collision threat
+        if (self.obstacle_info.detected and
+                self.obstacle_info.max_threat_level >= ThreatLevel.EMERGENCY):
             self.emergency_stop = True
             self.get_logger().warn("EMERGENCY COLLISION THREAT DETECTED!")
-            
-        # Check geofencing
-        if self.fused_position.magnitude() > self.nav_params.safety.max_distance:
-            self.get_logger().warn("Geofence violation - returning to home")
-            self.state = DroneState.RTH
-        
-        # Check altitude limits
+
+        # --- Geofence: distance from home (only when home is known)
+        if self.home_position_initialized:
+            home_dist = self.fused_position.distance_to(self.home_position)
+            if home_dist > self.nav_params.safety.max_distance:
+                self.get_logger().warn(f"Geofence breach ({home_dist:.0f}m) — RTH")
+                self.state = DroneState.RTH
+
+        # --- Altitude limit (NED: z negative is up, so check abs)
         if abs(self.fused_position.z) > self.nav_params.safety.max_altitude:
-            self.get_logger().warn("Altitude limit exceeded")
+            self.get_logger().warn("Altitude limit exceeded — stopping climb")
             self.emergency_stop = True
-        
+
         return True
     
     def _handle_enhanced_state_machine(self, dt: float):
@@ -1172,12 +1298,10 @@ class SmartNavigator(Node):
             self._handle_emergency_state()
         elif self.state == DroneState.RTH:
             self._handle_rth_state(dt)
-        elif self.state == DroneState.ACTIVETRACK:
-            self._handle_activetrack_state(dt)
-        elif self.state == DroneState.TERRAIN_FOLLOW:
-            self._handle_terrain_follow_state(dt)
         elif self.state == DroneState.GPS_DENIED:
             self._handle_gps_denied_state(dt)
+        # ACTIVETRACK and TERRAIN_FOLLOW are handled inside _handle_enhanced_move_state
+        # via self.flight_mode — they are not lifecycle states.
     
     def _handle_enhanced_move_state(self, dt: float):
         """Enhanced movement with trajectory following"""
@@ -1274,8 +1398,7 @@ class SmartNavigator(Node):
     
     def _execute_precision_hover(self, target_pos: Vector3D, target_yaw: float, dt: float):
         """Execute precision hovering control"""
-        # Get current yaw extracted from attitude quaternion in attitude_callback
-        current_yaw = getattr(self.sensor_data, '_current_yaw', 0.0)
+        current_yaw = self.sensor_data.yaw
         
         # Compute precision control
         control_acc, yaw_rate, precision_achieved = self.precision_hover.compute_control(
@@ -1328,10 +1451,16 @@ class SmartNavigator(Node):
             )
         self.last_desired_velocity = desired_velocity
         
-        # Calculate next position
+        # Calculate next position and publish with velocity feedforward
         next_pos = self.fused_position + desired_velocity * dt
-        
-        self.publish_setpoint(next_pos.x, next_pos.y, next_pos.z, 0.0)
+
+        self.publish_setpoint(
+            next_pos.x, next_pos.y, next_pos.z,
+            self.sensor_data.yaw,            # use actual yaw, not hardcoded 0
+            vx=desired_velocity.x,
+            vy=desired_velocity.y,
+            vz=desired_velocity.z
+        )
     
     def _follow_trajectory(self, dt: float):
         """Follow current trajectory"""
@@ -1344,7 +1473,29 @@ class SmartNavigator(Node):
         target_pos = self.current_trajectory.get_position_at_time(current_time)
         
         if target_pos:
-            self.publish_setpoint(target_pos.x, target_pos.y, target_pos.z, 0.0)
+            # Derive velocity feedforward index from elapsed time so it stays
+            # in sync with get_position_at_time (trajectory_index is never
+            # incremented, so using it directly always returns velocities[0]).
+            traj = self.current_trajectory
+            vel = Vector3D()
+            if traj.velocities and traj.timestamps and len(traj.timestamps) > 1:
+                # Find which segment current_time falls in (same logic as
+                # get_position_at_time) and read the corresponding velocity.
+                for i in range(len(traj.timestamps) - 1):
+                    if traj.timestamps[i] <= current_time <= traj.timestamps[i + 1]:
+                        if i < len(traj.velocities):
+                            vel = traj.velocities[i]
+                        break
+                else:
+                    # Past the last timestamp — use the final velocity
+                    if traj.velocities:
+                        vel = traj.velocities[-1]
+
+            self.publish_setpoint(
+                target_pos.x, target_pos.y, target_pos.z,
+                self.sensor_data.yaw,
+                vx=vel.x, vy=vel.y, vz=vel.z
+            )
         else:
             # Trajectory finished
             self.current_trajectory = None
@@ -1408,7 +1559,7 @@ class SmartNavigator(Node):
         fusion_status.data = [
             self.sensor_data.gps_accuracy,
             float(self.sensor_data.satellites_used),
-            self.sensor_data.vision_confidence,
+            self.sensor_data.vio_confidence,
             self.sensor_data.ground_distance,
             self.kalman_filter.P[0, 0],  # Position uncertainty X
             self.kalman_filter.P[1, 1],  # Position uncertainty Y
@@ -1479,8 +1630,9 @@ class SmartNavigator(Node):
                        self.fused_position.z - 3.0)
     
     def _handle_precision_landing_state(self, dt: float):
-        """Precision landing with vision guidance"""
-        # Use vision for precision landing (placeholder)
+        """Landing state: blind descent to home position.
+        TODO: replace with vision-guided precision landing (ArUco / optical flow)."""
+        # Placeholder — descends at fixed rate toward home_position with no visual feedback
         landing_target = self.home_position
         
         # Descend slowly with precision control
@@ -1511,18 +1663,23 @@ class SmartNavigator(Node):
         self.get_logger().error(f"Emergency triggered by: {self.safety_violations}")
 
     def _handle_gps_denied_state(self, dt: float):
-        """GPS-denied navigation: rely on VIO, loiter if VIO also lost"""
-        if self.sensor_data.vision_confidence > 0.5:
-            # VIO healthy — continue to destination at reduced speed
-            self.get_logger().warn("GPS denied, navigating on VIO only")
+        """GPS-denied navigation: rely on VIO; loiter if VIO also lost."""
+        now = time.time()
+        vio_fresh = (self.sensor_data.vio_valid and
+                     now - self.sensor_data.vio_timestamp < 2.0)
+        if vio_fresh:
+            # VIO healthy — continue at reduced speed (cap at half normal max)
+            self.get_logger().warn("GPS denied — navigating on VIO only",
+                                   throttle_duration_sec=5.0)
             self._fly_to_position(self.destination_point, dt)
         else:
-            # Both GPS and VIO unavailable — hold altitude, zero horizontal velocity
-            self.get_logger().error("GPS and VIO both unavailable — holding altitude")
-            hold_pos = Vector3D(self.fused_position.x,
-                                self.fused_position.y,
-                                self.fused_position.z)
-            self.publish_setpoint(hold_pos.x, hold_pos.y, hold_pos.z, 0.0)
+            # Both GPS and VIO unavailable — hold current position
+            self.get_logger().error("GPS and VIO both unavailable — loitering",
+                                    throttle_duration_sec=2.0)
+            self.publish_setpoint(
+                self.fused_position.x, self.fused_position.y, self.fused_position.z,
+                self.sensor_data.yaw
+            )
     
     # Enhanced vision processing
     def _process_frame_enhanced(self, frame: np.ndarray) -> ObstacleInfo:
@@ -1610,19 +1767,11 @@ class SmartNavigator(Node):
         ])
         ray_cam = ray_cam / np.linalg.norm(ray_cam)
 
-        # Get drone attitude quaternion [w, x, y, z] from sensor data.
-        # sensor_data.attitude stores the raw quaternion components from VehicleAttitude.
-        q = self.sensor_data.attitude  # Vector3D used as storage: x=q[0], y=q[1], z=q[2]
-        # VehicleAttitude.q is [w, x, y, z] — we stored q[0..2] in Vector3D x/y/z.
-        # Retrieve the full quaternion; w is stored separately if available.
-        q_w = getattr(self.sensor_data, '_q_w', 1.0)
-        q_vec = np.array([q_w, q.x, q.y, q.z])  # [w, x, y, z]
-
-        # Build rotation matrix from body to world (NED) using scipy
+        # Read attitude quaternion set by attitude_callback — (w, x, y, z)
         from scipy.spatial.transform import Rotation as R
-        # scipy expects [x, y, z, w]
-        rot = R.from_quat([q_vec[1], q_vec[2], q_vec[3], q_vec[0]])
-        R_body_world = rot.as_matrix()
+        w, x, y, z = self.sensor_data.attitude_quaternion
+        rot = R.from_quat([x, y, z, w])  # scipy expects [x, y, z, w]
+        R_body_world = rot.as_matrix()  # 3×3 rotation: body → NED world
 
         # Camera is assumed forward-facing, body-aligned (no separate extrinsic rotation).
         # In NED: camera z-forward maps to body x-forward.
@@ -1862,35 +2011,21 @@ class SmartNavigator(Node):
         cv2.waitKey(1)
     
     # Publishing methods (enhanced)
-    def publish_setpoint(self, x: float, y: float, z: float, yaw: float):
-        """Enhanced setpoint publishing with trajectory optimization"""
+    def publish_setpoint(self, x: float, y: float, z: float, yaw: float,
+                         vx: float = float('nan'), vy: float = float('nan'),
+                         vz: float = float('nan')):
+        """Publish position setpoint with optional velocity feedforward.
+
+        Passing vx/vy/vz lets PX4 EKF2 use feedforward for tighter tracking at speed.
+        If not supplied, PX4 will derive velocity from successive position setpoints.
+        """
         msg = TrajectorySetpoint()
         msg.position = [float(x), float(y), float(z)]
         msg.yaw = float(yaw)
-        
-        # Calculate velocity based on current flight mode
-        if hasattr(self, 'last_setpoint_time') and hasattr(self, 'last_setpoint'):
-            dt = time.time() - self.last_setpoint_time
-            if dt > 0:
-                dx = x - self.last_setpoint[0]
-                dy = y - self.last_setpoint[1]
-                dz = z - self.last_setpoint[2]
-                
-                # Apply flight mode constraints
-                limits = self.nav_params.get_current_performance_limits()
-                max_vel = limits['max_speed']
-                
-                velocity_magnitude = math.sqrt(dx*dx + dy*dy + dz*dz) / dt
-                if velocity_magnitude > max_vel:
-                    scale = max_vel / velocity_magnitude
-                    msg.velocity = [dx/dt * scale, dy/dt * scale, dz/dt * scale]
-                else:
-                    msg.velocity = [dx/dt, dy/dt, dz/dt]
-        
-        # Store for next iteration
-        self.last_setpoint = [x, y, z]
-        self.last_setpoint_time = time.time()
-        
+
+        # Use caller-supplied feedforward if provided; otherwise NaN (PX4 ignores NaN)
+        msg.velocity = [float(vx), float(vy), float(vz)]
+
         msg.timestamp = int(self.get_clock().now().nanoseconds / 1000)
         self.trajectory_setpoint_pub.publish(msg)
     

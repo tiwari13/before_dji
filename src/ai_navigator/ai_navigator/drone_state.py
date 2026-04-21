@@ -12,8 +12,8 @@ class DroneState(Enum):
     LANDING = "LANDING"
     DISARMED = "DISARMED"
     EMERGENCY = "EMERGENCY"
-    # Advanced autonomy states
-    RTH = "RTH"                          # Return to Home
-    ACTIVETRACK = "ACTIVETRACK"          # Subject following
-    TERRAIN_FOLLOW = "TERRAIN_FOLLOW"    # Terrain following mode
-    GPS_DENIED = "GPS_DENIED"            # VIO-only navigation
+    # Advanced lifecycle states
+    RTH = "RTH"              # Return to Home (safety / battery / geofence trigger)
+    GPS_DENIED = "GPS_DENIED"  # VIO-only navigation — GPS unavailable
+    # NOTE: ACTIVETRACK and TERRAIN_FOLLOW are FlightMode values, not lifecycle states.
+    # Feature behavior is selected via self.flight_mode inside the MOVE state.
