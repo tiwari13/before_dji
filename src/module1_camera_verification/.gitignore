@@ -1,0 +1,28 @@
+# ROS2 / colcon build artifacts
+build/
+install/
+log/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.eggs/
+dist/
+*.so
+
+# Byte-compiled
+*.pyc
+*.pyo
+
+# Images / data (comment out if you want to track them)
+*.png
+*.jpg
+*.jpeg
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~

@@ -1,0 +1,31 @@
+<?xml version="1.0"?>
+<?xml-model href="http://download.ros.org/schema/package_format3.xsd" schematypens="http://www.w3.org/2001/XMLSchema"?>
+<package format="3">
+  <name>module3_vio</name>
+  <version>0.0.1</version>
+  <description>
+    Phase 3: Visual-Inertial Odometry
+      Step 7  - OpenVINS sensor bridge + comparator (study a real VIO)
+      Step 8  - Loosely-coupled EKF VIO (your own EKF)
+      Step 9  - Tightly-coupled MSCKF (your own)
+      Step 10 - Multi-camera MSCKF
+  </description>
+  <maintainer email="ajay@drone.dev">ajay</maintainer>
+  <license>MIT</license>
+
+  <depend>rclpy</depend>
+  <depend>sensor_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>px4_msgs</depend>
+  <depend>cv_bridge</depend>
+
+  <test_depend>ament_copyright</test_depend>
+  <test_depend>ament_flake8</test_depend>
+  <test_depend>ament_pep257</test_depend>
+  <test_depend>python3-pytest</test_depend>
+
+  <export>
+    <build_type>ament_python</build_type>
+  </export>
+</package>

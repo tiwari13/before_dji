@@ -1,0 +1,18 @@
+{
+    "python.autoComplete.extraPaths": [
+        "/home/mcfb/ros2_ws/install/px4_ros_com/lib/python3.12/site-packages",
+        "/home/mcfb/ros2_ws/install/px4_offboard/lib/python3.12/site-packages",
+        "/home/mcfb/ros2_ws/install/px4_msgs/lib/python3.12/site-packages",
+        "/home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages",
+        "/home/mcfb/drone_venv/lib/python3.12/site-packages",
+        "/opt/ros/jazzy/lib/python3.12/site-packages"
+    ],
+    "python.analysis.extraPaths": [
+        "/home/mcfb/ros2_ws/install/px4_ros_com/lib/python3.12/site-packages",
+        "/home/mcfb/ros2_ws/install/px4_offboard/lib/python3.12/site-packages",
+        "/home/mcfb/ros2_ws/install/px4_msgs/lib/python3.12/site-packages",
+        "/home/mcfb/ros2_ws/install/ai_navigator/lib/python3.12/site-packages",
+        "/home/mcfb/drone_venv/lib/python3.12/site-packages",
+        "/opt/ros/jazzy/lib/python3.12/site-packages"
+    ]
+}

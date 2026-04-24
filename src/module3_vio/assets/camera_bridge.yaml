@@ -1,0 +1,102 @@
+# ROS2-Gazebo Bridge Configuration for x500_skydio_0
+# 6 cameras: front, right, back, left, up, down
+# Each camera has: image + camera_info
+
+# ============== CAMERA FRONT ==============
+- topic_name: "/world/default/model/x500_skydio_0/model/camera_front/link/camera_link/sensor/IMX214/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+- topic_name: "/world/default/model/x500_skydio_0/model/camera_front/link/camera_link/sensor/IMX214/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+
+# ============== CAMERA RIGHT ==============
+- topic_name: "/world/default/model/x500_skydio_0/model/camera_right/link/camera_link/sensor/IMX214/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+- topic_name: "/world/default/model/x500_skydio_0/model/camera_right/link/camera_link/sensor/IMX214/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+
+# ============== CAMERA BACK ==============
+- topic_name: "/world/default/model/x500_skydio_0/model/camera_back/link/camera_link/sensor/IMX214/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+- topic_name: "/world/default/model/x500_skydio_0/model/camera_back/link/camera_link/sensor/IMX214/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+
+# ============== CAMERA LEFT ==============
+- topic_name: "/world/default/model/x500_skydio_0/model/camera_left/link/camera_link/sensor/IMX214/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+- topic_name: "/world/default/model/x500_skydio_0/model/camera_left/link/camera_link/sensor/IMX214/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+
+# ============== CAMERA UP ==============
+- topic_name: "/world/default/model/x500_skydio_0/model/camera_up/link/camera_link/sensor/IMX214/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+- topic_name: "/world/default/model/x500_skydio_0/model/camera_up/link/camera_link/sensor/IMX214/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+
+# ============== CAMERA DOWN ==============
+- topic_name: "/world/default/model/x500_skydio_0/model/camera_down/link/camera_link/sensor/IMX214/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+- topic_name: "/world/default/model/x500_skydio_0/model/camera_down/link/camera_link/sensor/IMX214/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+
+# ============== OTHER SENSORS (Optional) ==============
+# Uncomment if you want to bridge these sensors too:
+
+# IMU — enabled at full 250 Hz for VIO
+- topic_name: "/world/default/model/x500_skydio_0/link/base_link/sensor/imu_sensor/imu"
+  ros_type_name: "sensor_msgs/msg/Imu"
+  gz_type_name: "gz.msgs.IMU"
+  direction: GZ_TO_ROS
+
+# Magnetometer
+# - topic_name: "/world/default/model/x500_skydio_0/link/base_link/sensor/magnetometer_sensor/magnetometer"
+#   ros_type_name: "sensor_msgs/msg/MagneticField"
+#   gz_type_name: "gz.msgs.Magnetometer"
+#   direction: GZ_TO_ROS
+
+# Air Pressure
+# - topic_name: "/world/default/model/x500_skydio_0/link/base_link/sensor/air_pressure_sensor/air_pressure"
+#   ros_type_name: "sensor_msgs/msg/FluidPressure"
+#   gz_type_name: "gz.msgs.FluidPressure"
+#   direction: GZ_TO_ROS
+
+# GPS/NavSat
+# - topic_name: "/world/default/model/x500_skydio_0/link/base_link/sensor/navsat_sensor/navsat"
+#   ros_type_name: "sensor_msgs/msg/NavSatFix"
+#   gz_type_name: "gz.msgs.NavSat"
+#   direction: GZ_TO_ROS
+
+# LiDAR Scan
+# - topic_name: "/world/default/model/x500_skydio_0/link/lidar_sensor_link/sensor/lidar/scan"
+#   ros_type_name: "sensor_msgs/msg/LaserScan"
+#   gz_type_name: "gz.msgs.LaserScan"
+#   direction: GZ_TO_ROS

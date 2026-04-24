@@ -1,0 +1,202 @@
+# ============================================================================
+# OpenVINS Configuration — x500_skydio_0 (monocular front camera)
+# ============================================================================
+#
+# STUDY REFERENCE
+# ---------------
+# Geneva et al., "OpenVINS: A Research Platform for Visual-Inertial
+# Estimation", ICRA 2020.  https://arxiv.org/abs/2203.10895
+# Docs: https://docs.openvins.com/classov_msckf_1_1VioManager.html
+#
+# ALGORITHM OVERVIEW
+# ------------------
+# OpenVINS implements a Multi-State Constraint Kalman Filter (MSCKF).
+# The EKF STATE is:
+#
+#   x = [p_I,  v_I,  q_GI,  b_g,  b_a,  p_C0,  q_C0I,  ...]
+#         pos  vel   orient  gyro  accel  cam     cam
+#         (in global frame)   bias  bias  clone  poses (sliding window)
+#
+# MSCKF KEY IDEA (Mourikis & Roumeliotis, ICRA 2007):
+#   When a feature is tracked across N camera poses in the sliding window,
+#   you can eliminate the feature itself from the measurement equation
+#   (project onto its left null space) and get a measurement that only
+#   involves the relative camera poses — no feature landmark in state needed.
+#   This keeps the state size bounded regardless of how many features you see.
+#
+# ============================================================================
+
+verbosity: "INFO"   # DEBUG / INFO / WARNING / ERROR / SILENT
+
+# ── EKF Options ──────────────────────────────────────────────────────────────
+# First-Estimates Jacobians (FEJ): compute Jacobians at the linearisation
+# point from the FIRST time a state was estimated, not its current estimate.
+# This preserves the observability properties of VIO and reduces drift.
+# See: Huang et al., "Analysis and Improvement of the Consistency of
+#      Extended Kalman Filter based SLAM", ICRA 2008.
+use_fej: true
+
+# Average consecutive IMU readings before integration (reduces noise)
+use_imu_avg: true
+
+# Use RK4 integration instead of Euler for IMU propagation (more accurate)
+use_rk4_integration: true
+
+# Gravity magnitude [m/s²] — standard gravity
+gravity_mag: 9.81
+
+# ── Calibration (all off for simulation — we know the exact values) ───────────
+# Turn these ON for a real drone where you want online refinement.
+calib_cam_extrinsics: false      # refine T_imu_cam online
+calib_cam_intrinsics: false      # refine fx, fy, cx, cy online
+calib_cam_timeoffset: false      # refine td (camera-IMU time offset) online
+calib_imu_g_sensitivity: false   # refine g-sensitivity matrix
+
+# ── State / Sliding Window ────────────────────────────────────────────────────
+# max_clones: number of camera poses kept in the sliding window.
+# More clones → longer tracks → better triangulation, but larger state.
+# 11 is a good balance (covers ~1.4 s at 8 Hz camera).
+max_clones: 11
+
+# SLAM features (landmarks in state) — 0 = pure MSCKF (no SLAM features)
+# Adding SLAM features helps with scale in degenerate motion.
+max_slam: 50
+max_slam_in_update: 25
+max_msckf_in_update: 40
+
+# Delay before adding SLAM features (wait for initialisation to settle)
+dt_slam_delay: 2.0
+
+# ── Initialisation ────────────────────────────────────────────────────────────
+# Wait this many seconds of IMU data before initialising.
+# The IMU must see enough excitation to distinguish gravity from accel.
+init_window_time: 0.75
+
+# Minimum IMU acceleration standard deviation to trigger init.
+# If the drone is perfectly still (simulated hover), lower this.
+init_imu_thresh: 0.5
+
+# ── Feature Tracker Options ───────────────────────────────────────────────────
+# OpenVINS uses the same KLT + grid approach we implemented in Step 6,
+# but with two improvements:
+#   1. Grid-based feature distribution (ensures spatial coverage)
+#   2. FAST detector as a fallback (quicker than Shi-Tomasi)
+
+num_pts: 250           # target feature count (we use 500 in Step 6)
+fast_threshold: 15     # FAST corner detector threshold
+grid_x: 8             # grid columns for even distribution (1920/8 = 240px wide)
+grid_y: 5             # grid rows (1080/5 = 216px tall)
+min_px_dist: 8        # minimum pixel distance between features
+knn_ratio: 0.70       # Lowe's ratio test threshold (same as Step 5)
+downsample_cameras: false   # set true to halve resolution (speeds up tracking)
+
+# Histogram equalisation helps with the dark-field simulation images
+use_histogram_equalization: true
+
+# ── Updater (measurement noise) ───────────────────────────────────────────────
+# sigma_pix: assumed image noise in pixels.
+# Smaller → trust features more, larger → trust IMU more.
+sigma_pix: 1.0
+
+# chi2_mult: scale the chi-squared outlier rejection threshold.
+# 1.0 = standard 95% confidence interval.
+chi2_mult: 1.0
+
+# ── Zero-Velocity Update (ZUPT) ───────────────────────────────────────────────
+# When the drone is stationary, use the zero-velocity constraint as a
+# measurement.  Useful for initialisation on the pad.
+try_zupt: true
+zupt_chi2_mult: 1.0
+zupt_max_velocity: 0.1   # m/s — below this → apply ZUPT
+
+# ============================================================================
+# CAMERA CONFIGURATION
+# ============================================================================
+#
+# T_imu_cam: homogeneous transform from camera frame → IMU (body) frame.
+# A point p_cam in camera frame maps to IMU frame as:
+#   p_imu = T_imu_cam * [p_cam; 1]
+#
+# From x500_skydio SDF model:
+#   camera_front pose in base_link: xyz=(0.15, 0, 0.10), rpy=(0, 0, 0)
+#
+# Camera Gazebo body frame orientation (when rpy=0):
+#   +X → forward (optical axis)
+#   +Y → left
+#   +Z → up
+#
+# This aligns with the drone body frame, so rotation part = Identity.
+# Translation = camera origin in IMU frame = [0.15, 0.0, 0.10].
+#
+# NOTE: For a real drone, run Kalibr (https://github.com/ethz-asl/kalibr)
+# to get the exact T_imu_cam.  A 1 cm error here accumulates over time.
+#
+# ============================================================================
+
+camera0:
+  timeoffset: 0.0      # td: camera timestamp = image_time - td
+                        # 0 for simulation (shared Gazebo clock)
+
+  resolution: [1920, 1080]
+
+  # Distortion model: radtan = (k1, k2, p1, p2)
+  # All zeros in simulation (ideal pinhole lens)
+  distortion_model: "radtan"
+  distortion_coeffs: [0.0, 0.0, 0.0, 0.0]
+
+  # [fx, fy, cx, cy] — from Module 1 calibration
+  intrinsics: [1397.22, 1397.22, 960.0, 540.0]
+
+  # T_imu_cam — row-major 4×4 homogeneous matrix
+  # Row 0: [R00, R01, R02, tx]
+  # Row 3: [0,   0,   0,   1 ]
+  T_imu_cam:
+    - [1.0, 0.0, 0.0, 0.15]
+    - [0.0, 1.0, 0.0,  0.0]
+    - [0.0, 0.0, 1.0, 0.10]
+    - [0.0, 0.0, 0.0,  1.0]
+
+# Second camera (back) — leave commented until Step 10
+# camera1:
+#   timeoffset: 0.0
+#   resolution: [1920, 1080]
+#   distortion_model: "radtan"
+#   distortion_coeffs: [0.0, 0.0, 0.0, 0.0]
+#   intrinsics: [1397.22, 1397.22, 960.0, 540.0]
+#   T_imu_cam:
+#     - [-1.0,  0.0, 0.0, -0.15]   # back camera: -X of body
+#     - [ 0.0, -1.0, 0.0,   0.0]
+#     - [ 0.0,  0.0, 1.0,  0.10]
+#     - [ 0.0,  0.0, 0.0,   1.0]
+
+# ============================================================================
+# IMU NOISE PARAMETERS
+# ============================================================================
+#
+# VIO needs to know the IMU noise model to set correct process noise in EKF.
+# Two sources of noise:
+#
+#   1. White noise (measurement noise):
+#      Modeled as N(0, σ²) per sample.
+#      In continuous time: noise density = σ/√(Δt)
+#      Units: gyro → rad/s/√Hz,  accel → m/s²/√Hz
+#
+#   2. Random walk (bias drift):
+#      The bias slowly wanders as a random walk.
+#      Units: gyro → rad/s²/√Hz,  accel → m/s³/√Hz
+#
+# Simulation values are very low (nearly ideal IMU).
+# For a real IMU (e.g., ICM-42688-P on Pixhawk 6C):
+#   sigma_w  ≈ 0.005,  sigma_wb ≈ 0.001
+#   sigma_a  ≈ 0.05,   sigma_ab ≈ 0.01
+#
+# You can get these from Allan Variance analysis of the IMU data.
+# See: https://github.com/gaowenliang/imu_utils
+#
+# ============================================================================
+
+imu_noises:
+  sigma_w:  0.005       # gyro white noise density   [rad/s/√Hz]
+  sigma_wb: 0.0001      # gyro random walk            [rad/s²/√Hz]
+  sigma_a:  0.05        # accel white noise density   [m/s²/√Hz]
+  sigma_ab: 0.001       # accel random walk            [m/s³/√Hz]
