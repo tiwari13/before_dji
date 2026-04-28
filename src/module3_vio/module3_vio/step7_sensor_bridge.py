@@ -11,7 +11,7 @@ This bridge re-publishes them so OpenVINS can subscribe.
 
 It also:
   • Validates sensor rates & timestamp alignment on startup
-  • Publishes camera_info constructed from our calibration (not just passthrough)
+  • Passes camera_info through from Gazebo (guarantees calibration consistency)
   • Logs diagnostic statistics every 5 s
 
 WHAT OPENVINS NEEDS
@@ -58,7 +58,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
 from sensor_msgs.msg import Image, Imu, CameraInfo
-import numpy as np
+import copy
 import time
 from collections import deque
 
@@ -74,13 +74,6 @@ CAM_FRONT_INFO = f'{DRONE}/model/camera_front/link/camera_link/sensor/IMX214/cam
 CAM_BACK_IMG   = f'{DRONE}/model/camera_back/link/camera_link/sensor/IMX214/image'
 CAM_BACK_INFO  = f'{DRONE}/model/camera_back/link/camera_link/sensor/IMX214/camera_info'
 
-# ── Camera intrinsics — scaled from Module 1 calibration (1920×1080 → 640×480)
-# Original: FX=FY=1397.22, CX=960, CY=540 at 1920×1080
-# Scale factor: 640/1920 = 1/3 for fx/fy/cx/cy
-FX = FY = 465.74        # 1397.22 / 3
-CX, CY   = 320.0, 180.0 # 960/3, 540/3
-WIDTH, HEIGHT = 640, 480
-
 # ── Best-effort QoS for PX4 / Gazebo bridge topics ───────────────────────────
 BEST_EFFORT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -88,47 +81,6 @@ BEST_EFFORT_QOS = QoSProfile(
     history=HistoryPolicy.KEEP_LAST,
     depth=10,
 )
-
-
-def _make_camera_info(stamp, frame_id: str) -> CameraInfo:
-    """
-    Construct a CameraInfo message from our known intrinsics.
-
-    OpenVINS can use this to avoid requiring a separate calibration file.
-    The distortion model is 'plumb_bob' (radtan) with all zeros for simulation.
-
-    Camera matrix layout (row-major):
-        K = [fx  0  cx]
-            [ 0 fy  cy]
-            [ 0  0   1]
-
-    OpenVINS uses fx, fy, cx, cy from K[0,0], K[1,1], K[0,2], K[1,2].
-    """
-    msg = CameraInfo()
-    msg.header.stamp    = stamp
-    msg.header.frame_id = frame_id
-    msg.width  = WIDTH
-    msg.height = HEIGHT
-
-    # Row-major 3×3 intrinsic matrix
-    msg.k = [FX,  0.0, CX,
-             0.0, FY,  CY,
-             0.0, 0.0, 1.0]
-
-    # Rectification matrix (identity for monocular)
-    msg.r = [1.0, 0.0, 0.0,
-             0.0, 1.0, 0.0,
-             0.0, 0.0, 1.0]
-
-    # Projection matrix (3×4, P = K [I | 0] for a single camera)
-    msg.p = [FX,  0.0, CX,  0.0,
-             0.0, FY,  CY,  0.0,
-             0.0, 0.0, 1.0, 0.0]
-
-    msg.distortion_model = 'plumb_bob'    # radtan: k1, k2, p1, p2, k3
-    msg.d = [0.0, 0.0, 0.0, 0.0, 0.0]   # no distortion in simulation
-
-    return msg
 
 
 class SensorBridge(Node):
@@ -140,17 +92,30 @@ class SensorBridge(Node):
     cam0  ← front camera   (primary)
     cam1  ← back camera    (second mono, useful later)
     imu0  ← base_link IMU
+
+    Calibration
+    -----------
+    CameraInfo is passed through directly from Gazebo — both the image and
+    the calibration always come from the same source, so they are guaranteed
+    to be consistent regardless of the actual sensor resolution.
     """
 
     def __init__(self):
         super().__init__('sensor_bridge')
 
+        # ── Latest CameraInfo from Gazebo (populated on first message) ─────────
+        self._cam0_info: CameraInfo | None = None
+        self._cam1_info: CameraInfo | None = None
+        self._cam0_info_logged = False
+        self._cam1_info_logged = False
+
         # ── Diagnostics ───────────────────────────────────────────────────────
-        self._imu_ts: deque  = deque(maxlen=500)   # recent IMU arrival times
+        self._imu_ts:  deque = deque(maxlen=500)   # recent IMU arrival times
         self._cam0_ts: deque = deque(maxlen=100)   # recent cam0 arrival times
-        self._cam1_ts: deque = deque(maxlen=100)
-        self._last_imu_stamp: float = 0.0
+        self._cam1_ts: deque = deque(maxlen=100)   # recent cam1 arrival times
+        self._last_imu_stamp:  float = 0.0
         self._last_cam0_stamp: float = 0.0
+        self._last_cam1_stamp: float = 0.0
         self._n_imu  = 0
         self._n_cam0 = 0
         self._n_cam1 = 0
@@ -191,6 +156,7 @@ class SensorBridge(Node):
         self.get_logger().info(f'  {CAM_BACK_IMG}')
         self.get_logger().info(f'       → /cam1/image_raw')
         self.get_logger().info('')
+        self.get_logger().info('Waiting for CameraInfo from Gazebo...')
         self.get_logger().info('Start OpenVINS in another terminal, then fly.')
 
     # ── IMU callback ──────────────────────────────────────────────────────────
@@ -224,11 +190,21 @@ class SensorBridge(Node):
         KLT optical flow (same as our Step 6) or descriptor matching.  It then
         uses the feature observations across the sliding window of camera poses
         (the MSCKF part) as measurements to correct the EKF state.
+
+        The CameraInfo is published co-temporally from the stored Gazebo info
+        so that the image and its calibration are always consistent.
         """
+        # Update frame_id to match OpenVINS convention, keep everything else
+        msg.header.frame_id = 'cam0'
         self._pub_c0img.publish(msg)
-        self._pub_c0inf.publish(
-            _make_camera_info(msg.header.stamp, 'cam0')
-        )
+
+        # Republish matching CameraInfo with updated stamp and frame_id
+        if self._cam0_info is not None:
+            info = copy.deepcopy(self._cam0_info)
+            info.header.stamp    = msg.header.stamp
+            info.header.frame_id = 'cam0'
+            self._pub_c0inf.publish(info)
+
         now = time.time()
         self._cam0_ts.append(now)
         self._last_cam0_stamp = (
@@ -237,36 +213,67 @@ class SensorBridge(Node):
         self._n_cam0 += 1
 
     def _cam0_inf_cb(self, msg: CameraInfo):
-        # Gazebo sends camera_info too; we re-publish our own (from calibration)
-        # so the values are guaranteed correct even if Gazebo's differ.
-        pass
+        """Store Gazebo's CameraInfo for co-temporal republishing with images."""
+        self._cam0_info = msg
+        if not self._cam0_info_logged:
+            self._cam0_info_logged = True
+            self.get_logger().info(
+                f'cam0 CameraInfo received: '
+                f'{msg.width}×{msg.height}  '
+                f'fx={msg.k[0]:.2f}  fy={msg.k[4]:.2f}  '
+                f'cx={msg.k[2]:.2f}  cy={msg.k[5]:.2f}'
+            )
 
     # ── Back camera callbacks ─────────────────────────────────────────────────
     def _cam1_img_cb(self, msg: Image):
+        msg.header.frame_id = 'cam1'
         self._pub_c1img.publish(msg)
-        self._pub_c1inf.publish(
-            _make_camera_info(msg.header.stamp, 'cam1')
+
+        if self._cam1_info is not None:
+            info = copy.deepcopy(self._cam1_info)
+            info.header.stamp    = msg.header.stamp
+            info.header.frame_id = 'cam1'
+            self._pub_c1inf.publish(info)
+
+        now = time.time()
+        self._cam1_ts.append(now)
+        self._last_cam1_stamp = (
+            msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
         )
         self._n_cam1 += 1
 
     def _cam1_inf_cb(self, msg: CameraInfo):
-        pass
+        """Store Gazebo's CameraInfo for co-temporal republishing with images."""
+        self._cam1_info = msg
+        if not self._cam1_info_logged:
+            self._cam1_info_logged = True
+            self.get_logger().info(
+                f'cam1 CameraInfo received: '
+                f'{msg.width}×{msg.height}  '
+                f'fx={msg.k[0]:.2f}  fy={msg.k[4]:.2f}  '
+                f'cx={msg.k[2]:.2f}  cy={msg.k[5]:.2f}'
+            )
 
     # ── Diagnostics ───────────────────────────────────────────────────────────
     def _status_cb(self):
         elapsed = time.time() - self._start
         imu_hz  = self._rate(self._imu_ts)
         cam0_hz = self._rate(self._cam0_ts)
+        cam1_hz = self._rate(self._cam1_ts)
 
-        # Camera-IMU time gap (should be < one IMU period = ~1/250 s = 4 ms)
-        time_gap_ms = abs(self._last_cam0_stamp - self._last_imu_stamp) * 1e3
+        # Time gap between camera header stamps and the last IMU header stamp.
+        # In simulation the shared clock keeps this near zero; a large value
+        # (> ~100 ms) suggests a topic is stalled, not a calibration error.
+        gap0_ms = abs(self._last_cam0_stamp - self._last_imu_stamp) * 1e3
+        gap1_ms = abs(self._last_cam1_stamp - self._last_imu_stamp) * 1e3
 
         self.get_logger().info(
             f'[{elapsed:5.1f}s]  '
             f'IMU: {imu_hz:5.1f} Hz ({self._n_imu})  '
             f'cam0: {cam0_hz:4.1f} Hz ({self._n_cam0})  '
-            f'cam1: {self._n_cam1}  '
-            f'Δt(cam-imu): {time_gap_ms:.1f} ms'
+            f'cam1: {cam1_hz:4.1f} Hz ({self._n_cam1})  '
+            f'Δt(cam0-imu): {gap0_ms:.1f} ms  '
+            f'Δt(cam1-imu): {gap1_ms:.1f} ms'
         )
 
         # Warn if rates look wrong
@@ -297,7 +304,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

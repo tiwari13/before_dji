@@ -40,15 +40,20 @@ Linearised process noise covariance Q (4×4 blocks):
 
 CAMERA UPDATE (Measurement Model)
 -----------------------------------
-At each keyframe, Step 6 gives us:
-  z = [Δp_VO, ΔR_VO]   — relative pose from keyframe k-1 to k
+At each keyframe, Step 6 gives us an absolute pose estimate:
+  z = [p_VO, q_VO]   — VO world-frame position and orientation
 
-We model this as:
-  z = h(x) + noise
+We model this as a noisy absolute pose measurement:
+  z = h(x) + n,   n ~ N(0, R_meas)
 
-where h(x) extracts the predicted relative pose from state.
+where h(x) extracts position and orientation from the EKF state.
+
 Innovation:
-  y = z - h(x̂)   (difference between observed and predicted relative pose)
+  y_p = p_VO - p̂                        (position residual)
+  y_φ = log(R_VO * R̂ᵀ)                  (orientation residual as rotation vector)
+
+This is a standard "absolute pose update" loosely-coupled design.
+The VO origin and the EKF world frame must be aligned (both start at identity).
 
 Measurement noise R (6×6):
   R = diag(σ_pos² I₃,  σ_rot² I₃)
@@ -56,7 +61,23 @@ Measurement noise R (6×6):
 EKF Update:
   K  = P Hᵀ (H P Hᵀ + R)⁻¹      [Kalman gain]
   δx = K y                          [state correction]
-  P  = (I - KH) P                  [covariance update]
+  P  = (I - KH) P (I-KH)ᵀ + K R Kᵀ   [Joseph form — numerically stable]
+
+PROCESS NOISE DISCRETISATION NOTE
+-----------------------------------
+σ_a, σ_g are continuous-time spectral densities (units: m/s²/√Hz, rad/s/√Hz).
+
+The correct discrete-time covariance contribution for a zero-order hold over dt is:
+
+  Q_d = σ² * dt   (for white noise driving terms)
+
+This arises from integrating the continuous process:
+  E[∫₀^dt n(t)n(τ)ᵀ dt dτ] = σ² * dt * I   (for white noise with PSD σ²)
+
+The G Q_d Gᵀ term in P_{k+1} = F P_k Fᵀ + G Q_d Gᵀ then has units [state²],
+consistent with the covariance update.
+
+So: q_discrete = σ_continuous² * dt   (NOT σ²/dt or σ²*rate).
 
 STUDY MATERIAL
 --------------
@@ -113,6 +134,13 @@ SIGMA_ROT = 0.05      # VO rotation noise [rad]
 # PX4 / Gazebo uses NED internally, but our bridge delivers ENU-like Imu.
 # In Gazebo simulation the IMU Z-axis is up, so gravity reads as -9.81 on Z.
 GRAVITY = np.array([0.0, 0.0, -9.81])
+
+# ── Frame convention ──────────────────────────────────────────────────────────
+# 'world'  = ENU world frame, origin at EKF initialisation point.
+#            +X East, +Y North, +Z Up.
+#            The VO node must use the same origin/convention for absolute
+#            pose measurements to be meaningful.
+# 'body'   = drone body frame, convention matches the IMU output frame.
 
 BEST_EFFORT_QOS = QoSProfile(
     reliability=ReliabilityPolicy.BEST_EFFORT,
@@ -234,6 +262,12 @@ class EkfVio(Node):
       /ekf_vio/odometry        nav_msgs/Odometry
       /ekf_vio/path            nav_msgs/Path
 
+    Measurement semantics:
+      /monocular_vo/pose carries an ABSOLUTE pose in the VO world frame.
+      The EKF treats it as a direct (noisy) observation of [p, q].
+      Both the VO node and this EKF must share the same world-frame origin
+      (both initialised to zero at the first keyframe).
+
     Note on /monocular_vo/pose:
       The monocular_vo.py (Step 6) does not currently publish a PoseStamped.
       You can either:
@@ -257,10 +291,6 @@ class EkfVio(Node):
         self._gt_origin    = None
         self._gt_traj      = []
         self._start        = time.time()
-
-        # Previous keyframe pose in world frame (for relative pose measurement)
-        self._kf_p: np.ndarray | None = None
-        self._kf_q: np.ndarray | None = None
 
         # ── Publishers ────────────────────────────────────────────────────────
         self._pub_odom = self.create_publisher(Odometry, '/ekf_vio/odometry', 10)
@@ -291,7 +321,7 @@ class EkfVio(Node):
         self.get_logger().info('=' * 60)
         self.get_logger().info('State: p(3) v(3) φ(3) b_a(3) b_g(3) = 15-dim')
         self.get_logger().info('IMU:   predicts state at high rate')
-        self.get_logger().info('VO:    corrects state at keyframe rate')
+        self.get_logger().info('VO:    absolute pose correction at keyframe rate')
         self.get_logger().info('')
         self.get_logger().info('NOTE: monocular_vo.py needs to publish')
         self.get_logger().info('      PoseStamped on /monocular_vo/pose')
@@ -316,21 +346,24 @@ class EkfVio(Node):
 
         ┌──────────────────────────────────────────────────────────────┐
         │  COVARIANCE PROPAGATION  (linearised around nominal state)   │
-        │  P_{k+1} = F P_k Fᵀ + G Q Gᵀ                               │
+        │  P_{k+1} = F P_k Fᵀ + G Q_d Gᵀ                             │
         │                                                              │
         │  F = ∂f/∂δx  (15×15 state transition Jacobian)              │
         │  G            (15×12 noise input Jacobian)                   │
-        │  Q = diag(σ_a², σ_g², σ_ab², σ_gb²) ⊗ I₃                  │
+        │  Q_d = diag(σ²*dt) — discrete noise (see module docstring)  │
         └──────────────────────────────────────────────────────────────┘
         """
         stamp = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
         if self._last_imu_time is None:
             self._last_imu_time = stamp
-            # Initialise orientation from IMU orientation field (Gazebo provides this).
-            # Without this, q defaults to identity [0,0,0,1] but the drone is pitched
-            # ~11.5° at rest, causing sin(11.5°)*9.81 ≈ 1.95 m/s² to leak as
-            # horizontal acceleration → 555 m position drift in 185 s.
+            # ── SIMULATION-SPECIFIC BOOTSTRAPPING ────────────────────────────
+            # Gazebo provides an absolute orientation in the IMU message.
+            # Production IMUs do NOT provide this — they only measure angular
+            # velocity and linear acceleration.  In a real system you would
+            # initialise orientation via static alignment (integrating g over
+            # several seconds at rest) or an external reference (magnetometer,
+            # GNSS heading).  The approach below is ONLY valid in simulation.
             q = np.array([
                 msg.orientation.x,
                 msg.orientation.y,
@@ -338,23 +371,17 @@ class EkfVio(Node):
                 msg.orientation.w,
             ])
             norm = np.linalg.norm(q)
-            if norm > 0.1:   # valid quaternion from sensor
+            if norm > 0.1:   # valid quaternion from Gazebo
                 self._state.q = q / norm
                 rpy = Rotation.from_quat(self._state.q).as_euler('xyz', degrees=True)
                 self.get_logger().info(
-                    f'First IMU: init q from orientation field  '
+                    f'[SIM] First IMU: init q from Gazebo orientation field  '
                     f'roll={rpy[0]:.1f}°  pitch={rpy[1]:.1f}°  yaw={rpy[2]:.1f}°'
                 )
             else:
-                # Fallback: estimate from accelerometer (assumes near-static)
-                a_m = np.array([
-                    msg.linear_acceleration.x,
-                    msg.linear_acceleration.y,
-                    msg.linear_acceleration.z,
-                ])
                 self.get_logger().warn(
-                    f'First IMU: orientation field invalid (norm={norm:.3f}), '
-                    f'using identity q — expect drift!'
+                    f'[SIM] First IMU: orientation field invalid (norm={norm:.3f}), '
+                    f'using identity q — expect gravity-projection drift!'
                 )
             self._state.is_initialised = True
             return
@@ -393,25 +420,33 @@ class EkfVio(Node):
         s.q = quat_multiply(s.q, dq)
         s.q /= np.linalg.norm(s.q)
 
-        # ── 3. Covariance propagation: P = F P Fᵀ + G Q Gᵀ ──────────────────
+        # ── 3. Covariance propagation: P = F P Fᵀ + G Q_d Gᵀ ────────────────
         F = self._build_F(R, a_cor, dt)
         G = self._build_G(R, dt)
 
-        # Continuous-time noise spectral density → discrete
-        IMU_RATE = 1.0 / dt
-        q_a  = SIGMA_A  ** 2 * IMU_RATE
-        q_g  = SIGMA_G  ** 2 * IMU_RATE
-        q_ab = SIGMA_AB ** 2 * IMU_RATE
-        q_gb = SIGMA_GB ** 2 * IMU_RATE
+        # Discrete noise covariance: Q_d = σ_continuous² * dt
+        # (see "PROCESS NOISE DISCRETISATION NOTE" in module docstring)
+        Q_d = np.diag([
+            SIGMA_A  ** 2 * dt,
+            SIGMA_A  ** 2 * dt,
+            SIGMA_A  ** 2 * dt,
+            SIGMA_G  ** 2 * dt,
+            SIGMA_G  ** 2 * dt,
+            SIGMA_G  ** 2 * dt,
+            SIGMA_AB ** 2 * dt,
+            SIGMA_AB ** 2 * dt,
+            SIGMA_AB ** 2 * dt,
+            SIGMA_GB ** 2 * dt,
+            SIGMA_GB ** 2 * dt,
+            SIGMA_GB ** 2 * dt,
+        ])
 
-        Q = np.diag([q_a]*3 + [q_g]*3 + [q_ab]*3 + [q_gb]*3)
-
-        s.P = F @ s.P @ F.T + G @ Q @ G.T
+        s.P = F @ s.P @ F.T + G @ Q_d @ G.T
 
         self._imu_count += 1
 
-        # Publish estimated pose at IMU rate
-        self._publish_odometry(stamp)
+        # Publish estimated pose at IMU rate, using the sensor timestamp
+        self._publish_odometry(msg.header.stamp)
 
     def _build_F(self, R: np.ndarray, a_cor: np.ndarray, dt: float) -> np.ndarray:
         """
@@ -466,20 +501,25 @@ class EkfVio(Node):
     # ── VO Callback: UPDATE STEP ───────────────────────────────────────────────
     def _vo_cb(self, msg: PoseStamped):
         """
-        EKF UPDATE (measurement correction).
+        EKF UPDATE (measurement correction) — absolute pose update.
 
         Called at keyframe rate (whenever Step 6 creates a new keyframe).
 
+        The measurement is an ABSOLUTE pose from the VO world frame:
+          z = [p_VO, q_VO]
+
         ┌──────────────────────────────────────────────────────────────┐
-        │  MEASUREMENT:  z = [p_VO, q_VO]  (absolute pose from VO)   │
+        │  MEASUREMENT:  z = [p_VO, q_VO]  (absolute VO pose)        │
         │                                                              │
-        │  For loose coupling we treat the VO pose as a noisy         │
-        │  measurement of the true pose:                               │
+        │  We model this as a noisy absolute pose observation:         │
         │    z = h(x) + n,   n ~ N(0, R_meas)                         │
         │                                                              │
         │  h(x) = [p, φ_from_q]   (extract position & orientation)   │
         │                                                              │
-        │  Innovation:   y = z - h(x̂)                                 │
+        │  Innovation:                                                  │
+        │    y_p = p_VO - p̂                                            │
+        │    y_φ = log(R_VO * R̂ᵀ)   (SO(3) log — rotation vector)    │
+        │                                                              │
         │  Jacobian H:   ∂h/∂δx  (6×15, maps state error to meas)    │
         │  Kalman gain:  K = P Hᵀ (HPHᵀ + R)⁻¹                      │
         │  Update:       δx = K y                                      │
@@ -504,10 +544,11 @@ class EkfVio(Node):
             msg.pose.orientation.z,
             msg.pose.orientation.w,
         ])
-        # Orientation error (VO orientation - EKF orientation) as rotation vector
-        R_meas = quat_to_rot(q_vo)
+
+        # Orientation residual: SO(3) log of R_VO * R_pred^T
+        R_vo   = quat_to_rot(q_vo)
         R_pred = s.rotation_matrix()
-        dR     = R_meas @ R_pred.T
+        dR     = R_vo @ R_pred.T
         dphi   = Rotation.from_matrix(dR).as_rotvec()
 
         # Innovation vector y ∈ ℝ⁶
@@ -522,7 +563,7 @@ class EkfVio(Node):
         H[0:3, 0:3] = np.eye(3)    # position
         H[3:6, 6:9] = np.eye(3)    # orientation
 
-        # Measurement noise covariance R_meas (6×6)
+        # Measurement noise covariance (6×6)
         R_meas_cov = np.diag([SIGMA_POS**2]*3 + [SIGMA_ROT**2]*3)
 
         # Kalman gain (15×6)
@@ -554,13 +595,14 @@ class EkfVio(Node):
         self._gt_traj.append(pos - self._gt_origin)
 
     # ── Publish ───────────────────────────────────────────────────────────────
-    def _publish_odometry(self, stamp: float):
+    def _publish_odometry(self, stamp):
+        """Publish odometry using the supplied sensor timestamp."""
         s = self._state
 
         odom = Odometry()
-        odom.header.stamp = self.get_clock().now().to_msg()
-        odom.header.frame_id = 'world'
-        odom.child_frame_id  = 'body'
+        odom.header.stamp    = stamp
+        odom.header.frame_id = 'world'   # ENU, origin at EKF init point
+        odom.child_frame_id  = 'body'    # drone body frame (matches IMU frame)
 
         odom.pose.pose.position.x = float(s.p[0])
         odom.pose.pose.position.y = float(s.p[1])
@@ -570,11 +612,14 @@ class EkfVio(Node):
         odom.pose.pose.orientation.z = float(s.q[2])
         odom.pose.pose.orientation.w = float(s.q[3])
 
-        # 6×6 pose covariance (row-major) from P[0:6, 0:6]
+        # 6×6 pose covariance (row-major) in ROS layout:
+        # [x, y, z, rot_x, rot_y, rot_z]
+        # Map from EKF state ordering [p, v, phi, b_a, b_g].
         cov6 = np.zeros(36)
-        for i in range(6):
-            for j in range(6):
-                cov6[i*6+j] = s.P[i, j]
+        pose_idx = [0, 1, 2, 6, 7, 8]
+        for i, src_i in enumerate(pose_idx):
+            for j, src_j in enumerate(pose_idx):
+                cov6[i * 6 + j] = s.P[src_i, src_j]
         odom.pose.covariance = list(cov6)
 
         self._pub_odom.publish(odom)
@@ -605,10 +650,6 @@ class EkfVio(Node):
         )
 
     def generate_report(self):
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
-
         print('\n' + '=' * 70)
         print('PHASE 3 — Step 8: LOOSELY-COUPLED EKF VIO REPORT')
         print('=' * 70)
@@ -651,10 +692,14 @@ def main(args=None):
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
-        node.generate_report()
+        try:
+            node.generate_report()
+        except Exception as e:
+            print(f'Report failed: {e}')
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

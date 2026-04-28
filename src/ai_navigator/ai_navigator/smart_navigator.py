@@ -16,7 +16,8 @@ from rclpy.qos import QoSProfile, ReliabilityPolicy, HistoryPolicy, DurabilityPo
 from px4_msgs.msg import (OffboardControlMode, TrajectorySetpoint, VehicleCommand, 
                          VehicleLocalPosition, SensorGps, VehicleImu, 
                          VehicleAttitude, VehicleAngularVelocity, DistanceSensor)
-from sensor_msgs.msg import Image as ROSImage, PointCloud2
+from sensor_msgs.msg import Image as ROSImage, PointCloud2, CameraInfo
+from sensor_msgs_py import point_cloud2 as pc2
 from nav_msgs.msg import Odometry
 from std_msgs.msg import Float32MultiArray
 
@@ -691,7 +692,7 @@ class TerrainFollowController:
         return max_slope <= self.params.terrain_follow.terrain_slope_limit
 
 class SmartNavigator(Node):
-    """Enhanced Smart Navigator with DJI Mavic 4 Pro level capabilities"""
+    """Enhanced autonomous navigation node."""
     
     def __init__(self):
         super().__init__('smart_navigator')
@@ -731,7 +732,7 @@ class SmartNavigator(Node):
         # Main control timer (100 Hz for precision)
         self.control_timer = self.create_timer(0.01, self.control_loop)
         
-        self.get_logger().info("🚁 Enhanced SmartNavigator initialized - DJI Mavic 4 Pro Level! 🚁")
+        self.get_logger().info("Enhanced SmartNavigator initialized")
     
     def _setup_qos_profiles(self):
         """Setup QoS profiles for different data types"""
@@ -804,6 +805,9 @@ class SmartNavigator(Node):
         self.image_sub = self.create_subscription(
             ROSImage, '/camera/image',
             self.image_callback, self.sensor_qos)
+        self.camera_info_sub = self.create_subscription(
+            CameraInfo, '/camera/camera_info',
+            self.camera_info_callback, self.sensor_qos)
 
         # Depth camera (requires manual bridge - see launch instructions)
         self.depth_sub = self.create_subscription(
@@ -833,6 +837,10 @@ class SmartNavigator(Node):
         # VIO freshness timeout — separate from GPS timeout because VIO runs at ~30 Hz
         # and should be declared stale much faster than a 1–5 Hz GPS signal.
         self.vio_timeout = self.declare_parameter('vio_timeout', 1.0).value
+        self.local_pose_timeout = self.declare_parameter(
+            'local_pose_timeout',
+            self.nav_params.safety.gps_timeout
+        ).value
     
     def _initialize_enhanced_state(self):
         """Initialize enhanced state variables"""
@@ -852,6 +860,10 @@ class SmartNavigator(Node):
         self.current_trajectory: Optional[Trajectory] = None
         self.trajectory_index = 0
         self.trajectory_start_time = 0.0
+        self.planning_request_in_flight = False
+        self.last_planning_request_time = 0.0
+        self.planning_request_interval = 0.25
+        self.camera_intrinsics: Optional[Dict[str, float]] = None
         
         # Safety and monitoring
         self.safety_violations = []
@@ -1061,6 +1073,20 @@ class SmartNavigator(Node):
                 
         except Exception as e:
             self.get_logger().error(f"Image processing failed: {e}")
+
+    def camera_info_callback(self, msg: CameraInfo):
+        """Store live camera intrinsics for pixel-to-world conversion."""
+        if len(msg.k) < 9:
+            return
+
+        self.camera_intrinsics = {
+            'fx': float(msg.k[0]),
+            'fy': float(msg.k[4]),
+            'cx': float(msg.k[2]),
+            'cy': float(msg.k[5]),
+            'width': int(msg.width),
+            'height': int(msg.height),
+        }
     
     def depth_callback(self, msg):
         """Depth camera callback"""
@@ -1140,16 +1166,24 @@ class SmartNavigator(Node):
         while True:
             try:
                 pointcloud_msg = self.processing_queues['lidar'].get(timeout=1.0)
-                
-                # Process LIDAR data for terrain following
-                # Convert to numpy array (simplified)
-                points = np.array([])  # Placeholder
+
+                points = np.asarray(
+                    list(pc2.read_points(
+                        pointcloud_msg,
+                        field_names=('x', 'y', 'z'),
+                        skip_nans=True
+                    )),
+                    dtype=np.float32
+                )
                 self.terrain_follow.update_terrain_data(points)
-                
             except queue.Empty:
                 continue
             except Exception as e:
                 self.get_logger().error(f"LIDAR processing error: {e}")
+            finally:
+                if 'pointcloud_msg' in locals():
+                    self.processing_queues['lidar'].task_done()
+                    del pointcloud_msg
     
     def _planning_processing_loop(self):
         """Asynchronous path planning thread"""
@@ -1182,11 +1216,15 @@ class SmartNavigator(Node):
                     self.current_trajectory = trajectory
                     self.trajectory_index = 0
                     self.trajectory_start_time = time.time()
-                
             except queue.Empty:
                 continue
             except Exception as e:
                 self.get_logger().error(f"Planning processing error: {e}")
+            finally:
+                if 'planning_request' in locals():
+                    self.planning_request_in_flight = False
+                    self.processing_queues['planning'].task_done()
+                    del planning_request
     
     def control_loop(self):
         """Main control loop at 100Hz"""
@@ -1230,7 +1268,7 @@ class SmartNavigator(Node):
 
         # --- Local pose timeout → emergency (no position at all)
         if (self.sensor_data.local_pose_valid and
-                now - self.sensor_data.local_pose_timestamp > self.nav_params.safety.gps_timeout):
+                now - self.sensor_data.local_pose_timestamp > self.local_pose_timeout):
             self.sensor_data.local_pose_valid = False
             self.get_logger().error("Local pose timeout — EMERGENCY")
             self.state = DroneState.EMERGENCY
@@ -1503,6 +1541,13 @@ class SmartNavigator(Node):
     
     def _request_path_planning(self):
         """Request asynchronous path planning"""
+        now = time.time()
+        if self.current_trajectory is not None:
+            return
+        if self.planning_request_in_flight:
+            return
+        if now - self.last_planning_request_time < self.planning_request_interval:
+            return
         if not self.processing_queues['planning'].full():
             planning_request = {
                 'start': self.fused_position,
@@ -1510,6 +1555,8 @@ class SmartNavigator(Node):
                 'obstacles': self.obstacle_info
             }
             self.processing_queues['planning'].put(planning_request)
+            self.planning_request_in_flight = True
+            self.last_planning_request_time = now
     
     def _point_gimbal_at_target(self, target: Vector3D):
         """Point gimbal at target (placeholder)"""
@@ -1665,8 +1712,10 @@ class SmartNavigator(Node):
     def _handle_gps_denied_state(self, dt: float):
         """GPS-denied navigation: rely on VIO; loiter if VIO also lost."""
         now = time.time()
-        vio_fresh = (self.sensor_data.vio_valid and
-                     now - self.sensor_data.vio_timestamp < 2.0)
+        vio_fresh = (
+            self.sensor_data.vio_valid and
+            now - self.sensor_data.vio_timestamp < self.vio_timeout
+        )
         if vio_fresh:
             # VIO healthy — continue at reduced speed (cap at half normal max)
             self.get_logger().warn("GPS denied — navigating on VIO only",
@@ -1753,11 +1802,22 @@ class SmartNavigator(Node):
         Pipeline:
           pixel → normalised camera ray → rotate by drone attitude → scale by depth → add position
         """
-        # Camera intrinsics (OakD-Lite at 640×480, scaled from Module 1 calibration)
-        fx = 465.74
-        fy = 465.74
-        cx_cam = 320.0
-        cy_cam = 240.0
+        intrinsics = self.camera_intrinsics
+        if intrinsics is not None:
+            fx = intrinsics['fx']
+            fy = intrinsics['fy']
+            cx_cam = intrinsics['cx']
+            cy_cam = intrinsics['cy']
+        elif self.depth_image is not None:
+            img_h, img_w = self.depth_image.shape[:2]
+            fx = fy = float(max(img_w, img_h))
+            cx_cam = img_w / 2.0
+            cy_cam = img_h / 2.0
+        else:
+            fx = 465.74
+            fy = 465.74
+            cx_cam = 320.0
+            cy_cam = 240.0
 
         # Back-project pixel to unit ray in camera frame (x-right, y-down, z-forward)
         ray_cam = np.array([
@@ -2054,7 +2114,7 @@ class SmartNavigator(Node):
     def arm(self):
         """Arm the drone"""
         self.publish_vehicle_command(VehicleCommand.VEHICLE_CMD_COMPONENT_ARM_DISARM, 1.0)
-        self.get_logger().info("🚁 Enhanced Smart Navigator ARMED - Ready for DJI-level flight! 🚁")
+        self.get_logger().info("Enhanced Smart Navigator armed")
     
     def __del__(self):
         """Cleanup"""

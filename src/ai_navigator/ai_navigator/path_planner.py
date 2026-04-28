@@ -149,10 +149,12 @@ class Trajectory:
 class OccupancyGrid3D:
     """3D occupancy grid for path planning"""
     
-    def __init__(self, bounds: Tuple[Vector3D, Vector3D], resolution: float = 0.5):
+    def __init__(self, bounds: Tuple[Vector3D, Vector3D], resolution: float = 0.5,
+                 obstacle_persistence_sec: float = 5.0):
         self.min_bounds = bounds[0]
         self.max_bounds = bounds[1]
         self.resolution = resolution
+        self.obstacle_persistence_sec = obstacle_persistence_sec
         
         # Calculate grid dimensions
         self.size_x = int((self.max_bounds.x - self.min_bounds.x) / resolution) + 1
@@ -161,6 +163,8 @@ class OccupancyGrid3D:
         
         # Initialize grid (0=free, 1=occupied, 0.5=unknown)
         self.grid = np.zeros((self.size_x, self.size_y, self.size_z), dtype=np.float32)
+        # Timestamp of last observation for each occupied cell
+        self.last_seen = np.full((self.size_x, self.size_y, self.size_z), -np.inf, dtype=np.float64)
         
         # Distance field for clearance calculations
         self.distance_field = np.full((self.size_x, self.size_y, self.size_z), float('inf'))
@@ -208,19 +212,32 @@ class OccupancyGrid3D:
         return 0.0
     
     def update_obstacles(self, obstacles: List[ObstacleCluster]):
-        """Update grid with current obstacles"""
-        # Reset grid
-        self.grid.fill(0.0)
+        """Update grid with current obstacles, keeping recent occupancy with decay."""
+        current_time = time.time()
+
+        # Age out stale occupied cells instead of clearing the whole map.
+        expired = (
+            np.isfinite(self.last_seen) &
+            ((current_time - self.last_seen) > self.obstacle_persistence_sec)
+        )
+        if np.any(expired):
+            self.grid[expired] = 0.0
+            self.last_seen[expired] = -np.inf
         
         # Add obstacles
         for obstacle in obstacles:
             if obstacle.bounding_box:
-                self._add_bounding_box(obstacle.bounding_box, obstacle.threat_level)
+                self._add_bounding_box(
+                    obstacle.bounding_box,
+                    obstacle.threat_level,
+                    current_time
+                )
         
         # Compute distance field
         self._compute_distance_field()
     
-    def _add_bounding_box(self, bbox: BoundingBox3D, threat_level: ThreatLevel):
+    def _add_bounding_box(self, bbox: BoundingBox3D, threat_level: ThreatLevel,
+                          timestamp: float):
         """Add bounding box to occupancy grid"""
         # Get grid bounds of bounding box
         half_dims = bbox.dimensions * 0.5
@@ -238,29 +255,18 @@ class OccupancyGrid3D:
                 for z in range(min_z, max_z + 1):
                     if 0 <= x < self.size_x and 0 <= y < self.size_y and 0 <= z < self.size_z:
                         self.grid[x, y, z] = max(self.grid[x, y, z], occupancy_value)
+                        self.last_seen[x, y, z] = timestamp
     
     def _compute_distance_field(self):
-        """Compute distance field using Euclidean distance transform"""
-        # Simple distance field computation (in production, use optimized algorithms)
-        self.distance_field.fill(float('inf'))
-        
-        # Find all occupied cells
-        occupied_cells = np.where(self.grid > 0.5)
-        
-        # For each free cell, compute distance to nearest occupied cell
-        for x in range(self.size_x):
-            for y in range(self.size_y):
-                for z in range(self.size_z):
-                    if self.grid[x, y, z] <= 0.5:  # Free cell
-                        min_dist = float('inf')
-                        
-                        # Find nearest occupied cell
-                        for i in range(len(occupied_cells[0])):
-                            ox, oy, oz = occupied_cells[0][i], occupied_cells[1][i], occupied_cells[2][i]
-                            dist = math.sqrt((x - ox)**2 + (y - oy)**2 + (z - oz)**2)
-                            min_dist = min(min_dist, dist)
-                        
-                        self.distance_field[x, y, z] = min_dist
+        """Compute distance field using a vectorized Euclidean distance transform."""
+        occupied = self.grid > 0.5
+        if np.any(occupied):
+            # EDT computes distance to nearest zero, so invert occupancy:
+            # free cells become True/non-zero, occupied become False/zero.
+            self.distance_field = distance_transform_edt(~occupied).astype(np.float32)
+        else:
+            # No occupied cells: clearance is effectively unbounded in the map.
+            self.distance_field.fill(float('inf'))
 
 class AStarPlanner:
     """A* path planning algorithm"""
@@ -282,21 +288,27 @@ class AStarPlanner:
         goal_node = PathNode(position=goal)
         
         open_set = []
+        open_lookup = {}
         closed_set = set()
         
         heapq.heappush(open_set, start_node)
+        open_lookup[self._position_hash(start)] = start_node
         
         iterations = 0
         while open_set and iterations < max_iterations:
             iterations += 1
             
             current = heapq.heappop(open_set)
+            current_hash = self._position_hash(current.position)
+            if open_lookup.get(current_hash) is not current:
+                continue
+            del open_lookup[current_hash]
             
             # Check if we reached the goal
             if current.position.distance_to(goal) < self.grid.resolution:
                 return self._reconstruct_path(current)
             
-            closed_set.add(self._position_hash(current.position))
+            closed_set.add(current_hash)
             
             # Explore neighbors
             for direction in self.directions:
@@ -332,18 +344,11 @@ class AStarPlanner:
                 neighbor.f_cost += clearance_bonus
                 
                 # Check if this path to neighbor is better
-                existing_neighbor = None
-                for node in open_set:
-                    if self._position_hash(node.position) == neighbor_hash:
-                        existing_neighbor = node
-                        break
+                existing_neighbor = open_lookup.get(neighbor_hash)
                 
                 if existing_neighbor is None or tentative_g < existing_neighbor.g_cost:
-                    if existing_neighbor:
-                        open_set.remove(existing_neighbor)
-                        heapq.heapify(open_set)
-                    
                     heapq.heappush(open_set, neighbor)
+                    open_lookup[neighbor_hash] = neighbor
         
         return []  # No path found
     
@@ -523,9 +528,11 @@ class DynamicWindowApproach:
     
     def __init__(self, params: NavigationParams):
         self.params = params
-        self.velocity_samples = 50
-        self.angular_samples = 20
+        self.linear_speed_samples = 11
+        self.heading_samples = 16
+        self.angular_samples = 9
         self.prediction_time = 2.0
+        self.dt = 0.1
         
     def plan(self, current_pos: Vector3D, current_vel: Vector3D, goal: Vector3D,
              obstacles: List[ObstacleCluster]) -> Tuple[Vector3D, Vector3D]:
@@ -534,48 +541,70 @@ class DynamicWindowApproach:
         best_velocity = current_vel
         best_score = float('-inf')
         
-        # Generate velocity samples
+        # Generate velocity samples using speed + heading instead of a dense
+        # Cartesian vx/vy lattice. This keeps the sample count bounded while
+        # still covering the local action space.
         max_vel = self.params.max_speed
         max_angular_vel = self.params.max_angular_velocity
-        
-        for v_x in np.linspace(-max_vel, max_vel, self.velocity_samples):
-            for v_y in np.linspace(-max_vel, max_vel, self.velocity_samples):
-                for omega in np.linspace(-max_angular_vel, max_angular_vel, self.angular_samples):
-                    
-                    velocity = Vector3D(v_x, v_y, 0)
-                    
-                    # Check velocity constraints
-                    if velocity.magnitude() > max_vel:
-                        continue
-                    
-                    # Predict trajectory
-                    trajectory = self._predict_trajectory(current_pos, velocity, omega)
-                    
-                    # Evaluate trajectory
-                    score = self._evaluate_trajectory(trajectory, goal, obstacles)
-                    
+        current_heading = math.atan2(current_vel.y, current_vel.x) if current_vel.magnitude() > 0.1 else 0.0
+
+        speed_samples = np.linspace(0.0, max_vel, self.linear_speed_samples)
+        heading_offsets = np.linspace(-math.pi, math.pi, self.heading_samples, endpoint=False)
+        omega_samples = np.linspace(-max_angular_vel, max_angular_vel, self.angular_samples)
+
+        for speed in speed_samples:
+            for heading_offset in heading_offsets:
+                initial_heading = current_heading + heading_offset
+                base_velocity = Vector3D(
+                    speed * math.cos(initial_heading),
+                    speed * math.sin(initial_heading),
+                    0.0
+                )
+
+                for omega in omega_samples:
+                    trajectory = self._predict_trajectory(
+                        current_pos,
+                        base_velocity,
+                        omega,
+                        initial_heading
+                    )
+
+                    score = self._evaluate_trajectory(
+                        trajectory,
+                        goal,
+                        obstacles,
+                        speed
+                    )
+
                     if score > best_score:
                         best_score = score
-                        best_velocity = velocity
+                        best_velocity = self._trajectory_initial_velocity(current_pos, trajectory)
         
         return best_velocity, goal  # Return velocity and next waypoint
     
     def _predict_trajectory(self, start_pos: Vector3D, velocity: Vector3D, 
-                          angular_vel: float) -> List[Vector3D]:
-        """Predict trajectory given velocity commands"""
+                          angular_vel: float, initial_heading: float) -> List[Vector3D]:
+        """Predict trajectory given planar speed and yaw rate."""
         trajectory = []
-        pos = start_pos
-        dt = 0.1  # Time step
-        steps = int(self.prediction_time / dt)
-        
+        pos = Vector3D(start_pos.x, start_pos.y, start_pos.z)
+        speed = velocity.magnitude()
+        heading = initial_heading
+        steps = int(self.prediction_time / self.dt)
+
         for _ in range(steps):
-            pos = pos + velocity * dt
+            heading += angular_vel * self.dt
+            step_velocity = Vector3D(
+                speed * math.cos(heading),
+                speed * math.sin(heading),
+                0.0
+            )
+            pos = pos + step_velocity * self.dt
             trajectory.append(Vector3D(pos.x, pos.y, pos.z))
         
         return trajectory
     
     def _evaluate_trajectory(self, trajectory: List[Vector3D], goal: Vector3D,
-                           obstacles: List[ObstacleCluster]) -> float:
+                           obstacles: List[ObstacleCluster], speed: float) -> float:
         """Evaluate trajectory quality"""
         if not trajectory:
             return float('-inf')
@@ -596,8 +625,8 @@ class DynamicWindowApproach:
         
         obstacle_score = min(1.0, min_obstacle_distance / 5.0)
         
-        # Velocity preference (maintain reasonable speed)
-        velocity_score = 0.5  # Neutral score for velocity
+        # Velocity preference (prefer progress, but do not overweight speed)
+        velocity_score = min(1.0, speed / max(0.1, self.params.max_speed))
         
         # Combine scores
         total_score = (0.4 * goal_score + 
@@ -605,6 +634,18 @@ class DynamicWindowApproach:
                       0.2 * velocity_score)
         
         return total_score
+
+    def _trajectory_initial_velocity(self, start_pos: Vector3D,
+                                     trajectory: List[Vector3D]) -> Vector3D:
+        """Recover the first-step velocity command implied by a predicted trajectory."""
+        if len(trajectory) < 1:
+            return Vector3D()
+        first = trajectory[0]
+        return Vector3D(
+            (first.x - start_pos.x) / self.dt,
+            (first.y - start_pos.y) / self.dt,
+            0.0
+        )
 
 class PathSmoother:
     """Path smoothing and optimization"""

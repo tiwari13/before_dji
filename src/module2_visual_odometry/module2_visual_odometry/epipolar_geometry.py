@@ -25,7 +25,7 @@ Fly the drone in a slow circle or figure-8 to collect a trajectory.
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CameraInfo
 from px4_msgs.msg import VehicleLocalPosition
 from cv_bridge import CvBridge
 import cv2
@@ -33,18 +33,14 @@ import numpy as np
 import time
 
 
-# ── Camera intrinsics from Module 1 calibration ──────────────────────────────
-K = np.array([
-    [1397.22,    0.0,  960.0],
-    [   0.0, 1397.22,  540.0],
-    [   0.0,    0.0,    1.0]
-], dtype=np.float64)
-
-
 class EpipolarGeometry(Node):
 
     def __init__(self):
         super().__init__('epipolar_geometry')
+
+        # ── Intrinsics — populated from live CameraInfo ───────────────────────
+        self.K           = None
+        self._K_received = False
 
         self.bridge = CvBridge()
 
@@ -72,11 +68,14 @@ class EpipolarGeometry(Node):
         self.frame_count = 0
 
         # ── Subscriptions ────────────────────────────────────────────────────
-        cam_topic = (
+        base = (
             '/world/default/model/x500_skydio_0/model'
-            '/camera_front/link/camera_link/sensor/IMX214/image'
+            '/camera_front/link/camera_link/sensor/IMX214'
         )
-        self.create_subscription(Image, cam_topic, self._image_cb, 10)
+        self.create_subscription(
+            CameraInfo, f'{base}/camera_info', self._camera_info_cb, 1
+        )
+        self.create_subscription(Image, f'{base}/image', self._image_cb, 10)
 
         self.create_subscription(
             VehicleLocalPosition,
@@ -90,6 +89,23 @@ class EpipolarGeometry(Node):
         self.get_logger().info("=" * 60)
         self.get_logger().info("PHASE 2  Step 5: Epipolar Geometry")
         self.get_logger().info("=" * 60)
+        self.get_logger().info("Waiting for CameraInfo...")
+
+    # ── CameraInfo ───────────────────────────────────────────────────────────
+    def _camera_info_cb(self, msg):
+        if self._K_received:
+            return
+        self.K = np.array([
+            [msg.k[0], 0.0,      msg.k[2]],
+            [0.0,      msg.k[4], msg.k[5]],
+            [0.0,      0.0,      1.0     ],
+        ], dtype=np.float64)
+        self._K_received = True
+        self.get_logger().info(
+            f"CameraInfo received: fx={msg.k[0]:.2f} fy={msg.k[4]:.2f} "
+            f"cx={msg.k[2]:.2f} cy={msg.k[5]:.2f} "
+            f"res={msg.width}x{msg.height}"
+        )
         self.get_logger().info("Fly a slow circle or figure-8")
         self.get_logger().info("Ctrl+C → full report + trajectory plot")
 
@@ -102,6 +118,9 @@ class EpipolarGeometry(Node):
 
     # ── Main image callback ──────────────────────────────────────────────────
     def _image_cb(self, msg):
+        if not self._K_received:
+            return
+
         bgr  = self.bridge.imgmsg_to_cv2(msg, "bgr8")
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
 
@@ -136,7 +155,7 @@ class EpipolarGeometry(Node):
         # RANSAC iteratively fits E and counts inliers (points satisfying
         # the epipolar constraint x2.T @ E @ x1 = 0 within `threshold` px)
         E, mask = cv2.findEssentialMat(
-            pts_curr, pts_prev, K,
+            pts_curr, pts_prev, self.K,
             method=cv2.RANSAC,
             prob=0.999,       # confidence that result is outlier-free
             threshold=1.0,    # max epipolar distance in pixels to be inlier
@@ -154,14 +173,14 @@ class EpipolarGeometry(Node):
         # ── Step 3: Recover R, t from E ──────────────────────────────────────
         # recoverPose picks the correct one of 4 (R,t) solutions using the
         # cheirality check: reconstructed points must be in front of both cameras
-        _, R, t, _ = cv2.recoverPose(E, pts_curr, pts_prev, K, mask=mask)
+        _, R, t, _ = cv2.recoverPose(E, pts_curr, pts_prev, self.K, mask=mask)
 
         # ── Step 4: Accumulate trajectory ─────────────────────────────────────
-        # Compose: world_R_cam  = prev_world_R_cam  @ frame_delta_R
-        #          world_t_cam += world_R_cam @ frame_delta_t
+        # Translation must use the PRE-update rotation so the delta is rotated
+        # into the world frame before R_accum is advanced.
         # Note: |t| = 1 always (monocular scale ambiguity — fixed in VIO)
+        self.t_accum  = self.t_accum + self.R_accum @ t
         self.R_accum  = R @ self.R_accum
-        self.t_accum += self.R_accum @ t
         self.estimated_traj.append(self.t_accum.flatten().copy())
 
         # ── Log ───────────────────────────────────────────────────────────────
@@ -243,18 +262,22 @@ class EpipolarGeometry(Node):
         # ── Plot ──────────────────────────────────────────────────────────────
         fig, axes = plt.subplots(1, 3, figsize=(18, 6))
 
-        # 1. Trajectory (top-down XZ view)
+        # 1. Trajectory (top-down X/Y view)
+        # Both VO and GT use X (axis 0) and Y (axis 1).
+        # Scales are NOT comparable — VO is unit-scale, GT is metric.
+        # This plot shows shape similarity only.
         ax = axes[0]
         if len(self.estimated_traj) > 1:
             traj = np.array(self.estimated_traj)
-            ax.plot(traj[:, 0], traj[:, 2], 'b-', lw=1.5, label='Epipolar VO (unit scale)')
-            ax.scatter(*traj[0, [0, 2]],  c='g', s=100, zorder=5, label='Start')
-            ax.scatter(*traj[-1, [0, 2]], c='r', s=100, marker='x', zorder=5, label='End')
+            ax.plot(traj[:, 0], traj[:, 1], 'b-', lw=1.5, label='Epipolar VO (unit scale)')
+            ax.scatter(traj[0, 0],  traj[0, 1],  c='g', s=100, zorder=5, label='Start')
+            ax.scatter(traj[-1, 0], traj[-1, 1], c='r', s=100, marker='x', zorder=5, label='End')
         if len(self.gt_traj) > 1:
             gt = np.array(self.gt_traj)
-            ax.plot(gt[:, 0], gt[:, 1], 'r--', lw=1.5, alpha=0.7, label='GT (NED X/Y)')
-        ax.set_xlabel('X'); ax.set_ylabel('Z')
-        ax.set_title('Trajectory (top-down)\nNote: VO scale is arbitrary')
+            ax.plot(gt[:, 0], gt[:, 1], 'r--', lw=1.5, alpha=0.7,
+                    label='GT NED X/Y (metric — scale not comparable)')
+        ax.set_xlabel('X'); ax.set_ylabel('Y')
+        ax.set_title('Trajectory shape (top-down)\nVO scale is arbitrary — shape only')
         ax.legend(fontsize=8); ax.grid(True); ax.set_aspect('equal')
 
         # 2. Inlier ratio over time
@@ -292,7 +315,8 @@ def main(args=None):
         node.generate_report()
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

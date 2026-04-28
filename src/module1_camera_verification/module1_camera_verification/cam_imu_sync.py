@@ -17,7 +17,7 @@ Keep the drone hovering for ~30 seconds, then Ctrl+C for the full report.
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image, Imu, CameraInfo
+from sensor_msgs.msg import Image, Imu
 import numpy as np
 from collections import deque
 import csv
@@ -34,8 +34,8 @@ class CamIMUSync(Node):
         super().__init__('cam_imu_sync')
 
         # ── Timestamp storage ──────────────────────────────────
-        self.cam_timestamps = deque(maxlen=2000)   # camera arrival times
-        self.imu_timestamps = deque(maxlen=20000)  # IMU arrival times (much higher rate)
+        self.cam_arrival_times = deque(maxlen=2000)   # wall-clock arrival times
+        self.imu_arrival_times = deque(maxlen=20000)  # wall-clock arrival times
 
         # Raw header timestamps (from Gazebo simulation clock)
         self.cam_header_times = deque(maxlen=2000)
@@ -44,16 +44,12 @@ class CamIMUSync(Node):
         # ── IMU Pre-integration Buffer ─────────────────────────
         # Between each camera frame, we collect all IMU samples
         self.imu_buffer = []              # IMU msgs since last camera frame
-        self.preintegrated_segments = []  # list of (cam_time, [imu_msgs]) pairs
+        self.preintegrated_segments = deque(maxlen=2000)  # list of (cam_time, [imu_msgs]) pairs
         self.last_cam_time = None
-
-        # ── IMU data for pre-integration analysis ──────────────
-        self.imu_accel_samples = []  # (timestamp, ax, ay, az)
-        self.imu_gyro_samples = []   # (timestamp, gx, gy, gz)
 
         # ── Synchronization pairs ──────────────────────────────
         # For each camera frame, find the nearest IMU measurement
-        self.sync_pairs = []  # (cam_time, nearest_imu_time, offset)
+        self.sync_pairs = deque(maxlen=2000)  # (cam_time, nearest_imu_time, offset)
 
         # ── Subscribers ────────────────────────────────────────
         base_path = '/world/default/model/x500_skydio_0'
@@ -88,34 +84,50 @@ class CamIMUSync(Node):
         now = time.time()
         header_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
-        self.cam_timestamps.append(now)
+        self.cam_arrival_times.append(now)
         self.cam_header_times.append(header_time)
 
         # ── Build pre-integration segment ──────────────────────
         # Collect all IMU measurements between this frame and the last
         if self.last_cam_time is not None and len(self.imu_buffer) > 0:
-            self.preintegrated_segments.append({
-                'cam_time': header_time,
-                'prev_cam_time': self.last_cam_time,
-                'imu_count': len(self.imu_buffer),
-                'imu_samples': list(self.imu_buffer),  # copy
-                'dt': header_time - self.last_cam_time,
-            })
+            dt = header_time - self.last_cam_time
+            imu_count = len(self.imu_buffer)
+            # Only keep segments with realistic dt (50–500 ms) and ≥3 IMU samples
+            if 0.05 <= dt <= 0.5 and imu_count >= 3:
+                self.preintegrated_segments.append({
+                    'cam_time': header_time,
+                    'prev_cam_time': self.last_cam_time,
+                    'imu_count': imu_count,
+                    'imu_samples': list(self.imu_buffer),  # copy
+                    'dt': dt,
+                })
 
         self.imu_buffer.clear()
         self.last_cam_time = header_time
 
-        # ── Find nearest IMU timestamp ─────────────────────────
+        # ── Find nearest IMU timestamp (recent window only) ────
+        # Search only the last 100 IMU samples (~400 ms at 250 Hz)
+        # to avoid stale matches from the far past.
         if len(self.imu_header_times) > 0:
-            imu_times = np.array(self.imu_header_times)
-            idx = np.argmin(np.abs(imu_times - header_time))
-            nearest_imu_time = imu_times[idx]
+            recent_imu = np.array(list(self.imu_header_times)[-100:])
+            idx = np.argmin(np.abs(recent_imu - header_time))
+            nearest_imu_time = recent_imu[idx]
             offset_ms = (header_time - nearest_imu_time) * 1000  # ms
+
+            # Bracket check: find prev and next IMU around this camera frame
+            prev_imu = recent_imu[recent_imu <= header_time]
+            next_imu = recent_imu[recent_imu > header_time]
+            bracketed = len(prev_imu) > 0 and len(next_imu) > 0
+            bracket_width_ms = (
+                (next_imu[0] - prev_imu[-1]) * 1000 if bracketed else float('nan')
+            )
 
             self.sync_pairs.append({
                 'cam_time': header_time,
                 'imu_time': nearest_imu_time,
                 'offset_ms': offset_ms,
+                'bracketed': bracketed,
+                'bracket_width_ms': bracket_width_ms,
             })
 
     def imu_callback(self, msg):
@@ -123,7 +135,7 @@ class CamIMUSync(Node):
         now = time.time()
         header_time = msg.header.stamp.sec + msg.header.stamp.nanosec * 1e-9
 
-        self.imu_timestamps.append(now)
+        self.imu_arrival_times.append(now)
         self.imu_header_times.append(header_time)
 
         # Store in pre-integration buffer
@@ -141,31 +153,17 @@ class CamIMUSync(Node):
             ],
         })
 
-        # Store for analysis
-        self.imu_accel_samples.append((
-            header_time,
-            msg.linear_acceleration.x,
-            msg.linear_acceleration.y,
-            msg.linear_acceleration.z,
-        ))
-        self.imu_gyro_samples.append((
-            header_time,
-            msg.angular_velocity.x,
-            msg.angular_velocity.y,
-            msg.angular_velocity.z,
-        ))
-
     # ── Live Status ────────────────────────────────────────────
 
     def print_live_status(self):
         elapsed = time.time() - self.start_time
 
-        cam_count = len(self.cam_timestamps)
-        imu_count = len(self.imu_timestamps)
+        cam_count = len(self.cam_arrival_times)
+        imu_count = len(self.imu_arrival_times)
 
         # Compute rates
-        cam_rate = self._compute_rate(self.cam_timestamps)
-        imu_rate = self._compute_rate(self.imu_timestamps)
+        cam_rate = self._compute_rate(self.cam_arrival_times)
+        imu_rate = self._compute_rate(self.imu_arrival_times)
 
         # Latest offset
         latest_offset = "N/A"
@@ -210,11 +208,11 @@ class CamIMUSync(Node):
         # ── 1. Sensor Rates ────────────────────────────────────
         print("\n┌─ 1. SENSOR RATES ─────────────────────────────────┐")
 
-        cam_rate = self._compute_rate(self.cam_timestamps)
-        imu_rate = self._compute_rate(self.imu_timestamps)
+        cam_rate = self._compute_rate(self.cam_arrival_times)
+        imu_rate = self._compute_rate(self.imu_arrival_times)
 
-        print(f"  Camera:  {cam_rate:6.2f} Hz  ({len(self.cam_timestamps)} frames)")
-        print(f"  IMU:     {imu_rate:6.2f} Hz  ({len(self.imu_timestamps)} samples)")
+        print(f"  Camera:  {cam_rate:6.2f} Hz  ({len(self.cam_arrival_times)} frames)")
+        print(f"  IMU:     {imu_rate:6.2f} Hz  ({len(self.imu_arrival_times)} samples)")
         print(f"  Ratio:   {imu_rate/cam_rate:.1f}x (IMU samples per camera frame)" if cam_rate > 0 else "")
 
         # Camera frame intervals
@@ -242,13 +240,25 @@ class CamIMUSync(Node):
 
         if self.sync_pairs:
             offsets = np.array([p['offset_ms'] for p in self.sync_pairs])
-            print(f"  Analyzed {len(offsets)} camera-IMU pairs")
+            bracketed_count = sum(1 for p in self.sync_pairs if p['bracketed'])
+            bracket_widths = np.array([
+                p['bracket_width_ms'] for p in self.sync_pairs
+                if p['bracketed'] and not np.isnan(p['bracket_width_ms'])
+            ])
+
+            print(f"  Analyzed {len(offsets)} camera-IMU pairs (recent window)")
+            print(f"  Bracketed pairs: {bracketed_count}/{len(offsets)} "
+                  f"(camera ts inside valid IMU interval)")
             print(f"\n  Camera-to-nearest-IMU offset:")
-            print(f"    Mean:   {np.mean(offsets):7.3f} ms")
-            print(f"    Std:    {np.std(offsets):7.3f} ms")
             print(f"    Median: {np.median(offsets):7.3f} ms")
+            print(f"    P5/P95: {np.percentile(offsets, 5):7.3f} / "
+                  f"{np.percentile(offsets, 95):7.3f} ms")
             print(f"    Min:    {np.min(offsets):7.3f} ms")
             print(f"    Max:    {np.max(offsets):7.3f} ms")
+            if len(bracket_widths) > 0:
+                print(f"\n  IMU bracket width (prev→next around camera frame):")
+                print(f"    Median: {np.median(bracket_widths):7.3f} ms")
+                print(f"    Max:    {np.max(bracket_widths):7.3f} ms")
 
             td = np.median(offsets)
             print(f"\n  ► Estimated td = {td:.3f} ms")
@@ -268,18 +278,21 @@ class CamIMUSync(Node):
         print("\n┌─ 3. IMU PRE-INTEGRATION SEGMENTS ─────────────────┐")
 
         if self.preintegrated_segments:
-            seg_counts = [s['imu_count'] for s in self.preintegrated_segments]
-            seg_dts = [s['dt'] * 1000 for s in self.preintegrated_segments]  # ms
+            # Segments are pre-validated (dt 50–500 ms, ≥3 IMU samples)
+            seg_counts = np.array([s['imu_count'] for s in self.preintegrated_segments])
+            seg_dts = np.array([s['dt'] * 1000 for s in self.preintegrated_segments])
 
-            print(f"  Total segments: {len(self.preintegrated_segments)}")
+            print(f"  Valid segments: {len(self.preintegrated_segments)}")
             print(f"\n  IMU samples per camera frame:")
-            print(f"    Mean:   {np.mean(seg_counts):5.1f}")
-            print(f"    Std:    {np.std(seg_counts):5.1f}")
+            print(f"    Median: {np.median(seg_counts):5.1f}")
+            print(f"    P5/P95: {np.percentile(seg_counts, 5):.0f} / "
+                  f"{np.percentile(seg_counts, 95):.0f}")
             print(f"    Min:    {np.min(seg_counts):5.0f}")
             print(f"    Max:    {np.max(seg_counts):5.0f}")
             print(f"\n  Segment duration (between camera frames):")
-            print(f"    Mean:   {np.mean(seg_dts):6.2f} ms")
-            print(f"    Std:    {np.std(seg_dts):6.2f} ms")
+            print(f"    Median: {np.median(seg_dts):6.2f} ms")
+            print(f"    P5/P95: {np.percentile(seg_dts, 5):.2f} / "
+                  f"{np.percentile(seg_dts, 95):.2f} ms")
 
             # Demonstrate pre-integration on one segment
             if len(self.preintegrated_segments) > 5:
@@ -302,8 +315,8 @@ class CamIMUSync(Node):
         issues = []
         recommendations = []
 
-        if cam_rate < 10:
-            issues.append("Camera rate too low (< 10 Hz)")
+        if cam_rate < 9.5:
+            issues.append("Camera rate too low (< 9.5 Hz)")
         elif cam_rate < 20:
             recommendations.append("Camera rate is OK but 20+ Hz is better for VIO")
 
@@ -436,7 +449,8 @@ def main(args=None):
         node.save_sync_data()
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

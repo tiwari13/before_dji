@@ -39,6 +39,22 @@ PIPELINE (per image frame)
   5. EKF update (batch)
   6. Marginalize oldest camera state if window is full
 
+PROCESS NOISE DISCRETISATION
+------------------------------
+σ_a, σ_g are continuous-time spectral densities (units: m/s²/√Hz, rad/s/√Hz).
+
+The discrete covariance contribution for a zero-order hold over dt is:
+
+  Q_d = G @ Q_c @ G.T * dt
+
+where Q_c = diag(σ²) (the continuous-time noise matrix) and G maps noise
+inputs to state derivatives (units of 1/s after dt scaling, so Q_d has
+correct state² units).
+
+The previous form G @ (Q_c/dt) @ G.T * dt = G @ Q_c @ G.T is algebraically
+equivalent but obscures the intent — the /dt and *dt cancel, leaving Q_c
+unchanged.  The correct first-order discretisation is simply G @ Q_c @ G.T * dt.
+
 STUDY MATERIAL
 --------------
 [1] Mourikis & Roumeliotis, "A Multi-State Constraint Kalman Filter for
@@ -58,6 +74,15 @@ STUDY MATERIAL
     https://arxiv.org/abs/1812.01537
     Background on SO(3) and right-perturbation conventions used here.
 
+FEATURE JACOBIAN CONVENTION
+-----------------------------
+Right-perturbation is used throughout: R_C → R_C @ exp(skew(δφ_C)).
+
+For a point z_c = R_C.T @ (p_f - p_C) in the camera frame:
+  ∂z_c/∂δφ_C = skew(z_c)   (from d/dε [R @ exp(εK)]^T X at ε=0)
+  ∂z_c/∂δp_C = -R_C.T
+  ∂z_c/∂δp_f =  R_C.T
+
 Run
 ---
   ros2 run module3_vio msckf_vio
@@ -67,7 +92,7 @@ import rclpy
 from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 
-from sensor_msgs.msg import Imu, Image
+from sensor_msgs.msg import Imu, Image, CameraInfo
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PoseStamped
 
@@ -77,11 +102,6 @@ from scipy.stats import chi2
 import cv2
 import time
 from collections import defaultdict
-
-# ── Camera intrinsics (640×480 — from sensor_bridge) ─────────────────────────
-FX = FY = 465.74
-CX, CY  = 320.0, 180.0
-IMG_W, IMG_H = 640, 480
 
 # ── Camera-IMU extrinsics (camera position/orientation in IMU body frame) ─────
 # Front camera: 0.15 m forward, 0.10 m up; axes aligned with IMU
@@ -195,12 +215,15 @@ class FeatureTracker:
     Tracks image features across frames using Lucas-Kanade optical flow.
 
     tracks[fid] = list of {'cam_id': int, 'u': float, 'v': float}
-      where u, v are NORMALISED coords: u = (px - CX)/FX, v = (py - CY)/FY.
+      where u, v are NORMALISED coords: u = (px - cx)/fx, v = (py - cy)/fy.
 
     cam_id is the globally-unique ID assigned to each camera state at
     augmentation time.  This lets us match observations to camera states
     even after old states are marginalized (removing them from the window
     changes indices but not IDs).
+
+    Intrinsics (fx, fy, cx, cy, img_w, img_h) are passed in at construction
+    and must match the live CameraInfo received by MsckfVio.
     """
 
     LK_PARAMS = dict(
@@ -209,7 +232,15 @@ class FeatureTracker:
         criteria  = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
     )
 
-    def __init__(self):
+    def __init__(self, fx: float, fy: float, cx: float, cy: float,
+                 img_w: int, img_h: int):
+        self._fx = fx
+        self._fy = fy
+        self._cx = cx
+        self._cy = cy
+        self._img_w = img_w
+        self._img_h = img_h
+
         self._next_fid = 0
         self._prev_img: np.ndarray | None = None
         self._pts:   np.ndarray | None = None   # Nx1x2 float32
@@ -247,9 +278,9 @@ class FeatureTracker:
         fb_err = np.abs(self._pts - prev_pts2).reshape(-1, 2).max(axis=1)
         ok = (st_fwd.flatten() == 1) & (st_bwd.flatten() == 1) & (fb_err < 2.0)
 
-        # In-bounds check
+        # In-bounds check using live image dimensions
         nx, ny = next_pts[:, 0, 0], next_pts[:, 0, 1]
-        ok &= (nx >= 5) & (nx < IMG_W - 5) & (ny >= 5) & (ny < IMG_H - 5)
+        ok &= (nx >= 5) & (nx < self._img_w - 5) & (ny >= 5) & (ny < self._img_h - 5)
 
         # ── Update tracks ─────────────────────────────────────────────────────
         kept_pts, kept_ids = [], []
@@ -259,8 +290,8 @@ class FeatureTracker:
                 px, py = float(next_pts[i, 0, 0]), float(next_pts[i, 0, 1])
                 self.tracks[fid].append({
                     'cam_id': cam_id,
-                    'u': (px - CX) / FX,
-                    'v': (py - CY) / FY,
+                    'u': (px - self._cx) / self._fx,
+                    'v': (py - self._cy) / self._fy,
                 })
                 if len(self.tracks[fid]) >= MAX_TRACK_LEN:
                     # Force marginalize long tracks
@@ -303,8 +334,8 @@ class FeatureTracker:
             self._next_fid += 1
             self.tracks[fid].append({
                 'cam_id': cam_id,
-                'u': (px - CX) / FX,
-                'v': (py - CY) / FY,
+                'u': (px - self._cx) / self._fx,
+                'v': (py - self._cy) / self._fy,
             })
             if self._pts is None:
                 self._pts = pt.reshape(1, 1, 2)
@@ -457,7 +488,12 @@ class MsckfVio(Node):
         super().__init__('msckf_vio')
 
         self._state   = MsckfState()
-        self._tracker = FeatureTracker()
+        self._tracker: FeatureTracker | None = None   # created after CameraInfo
+
+        # Intrinsics — populated from live /cam0/camera_info
+        self._fx = self._fy = self._cx = self._cy = None
+        self._img_w = self._img_h = None
+        self._cam_info_received = False
 
         self._last_imu_t: float | None = None
         self._imu_count    = 0
@@ -465,9 +501,10 @@ class MsckfVio(Node):
         self._feat_count   = 0
         self._start        = time.time()
 
-        # Static IMU initialisation: buffer readings for STATIC_INIT_DUR seconds
-        # while drone is stationary on the ground, then estimate biases.
-        self._static_buf: list[tuple] = []   # (am, wm)
+        # Static IMU initialisation: buffer readings while drone is stationary,
+        # then estimate biases from mean.
+        self._static_buf: list[tuple]  = []   # (am, wm)
+        self._static_start_t: float | None = None   # first IMU sensor timestamp
         self._static_init_done = False
         self._static_init_dur  = 2.0         # seconds of static data to collect
 
@@ -489,8 +526,9 @@ class MsckfVio(Node):
         self._path_msg.header.frame_id = 'world'
 
         # ── Subscribers ────────────────────────────────────────────────────────
-        self.create_subscription(Imu,   '/imu0',           self._imu_cb, 50)
-        self.create_subscription(Image, '/cam0/image_raw', self._img_cb, 10)
+        self.create_subscription(Imu,        '/imu0',            self._imu_cb,     50)
+        self.create_subscription(CameraInfo, '/cam0/camera_info',self._cam_info_cb, 1)
+        self.create_subscription(Image,      '/cam0/image_raw',  self._img_cb,     10)
 
         self.create_timer(5.0, self._status_cb)
 
@@ -500,6 +538,29 @@ class MsckfVio(Node):
         self.get_logger().info(
             f'Window: {MAX_CAM_STATES}  Min track: {MIN_TRACK_LEN}  '
             f'Pixel σ: {PIXEL_STD} px  Max feats: {MAX_FEATURES}')
+        self.get_logger().info('Waiting for /cam0/camera_info...')
+
+    # ── CameraInfo callback ────────────────────────────────────────────────────
+
+    def _cam_info_cb(self, msg: CameraInfo):
+        if self._cam_info_received:
+            return
+        self._fx    = msg.k[0]
+        self._fy    = msg.k[4]
+        self._cx    = msg.k[2]
+        self._cy    = msg.k[5]
+        self._img_w = msg.width
+        self._img_h = msg.height
+        self._cam_info_received = True
+        self._tracker = FeatureTracker(
+            self._fx, self._fy, self._cx, self._cy,
+            self._img_w, self._img_h,
+        )
+        self.get_logger().info(
+            f'CameraInfo received: {msg.width}×{msg.height}  '
+            f'fx={self._fx:.2f}  fy={self._fy:.2f}  '
+            f'cx={self._cx:.2f}  cy={self._cy:.2f}'
+        )
 
     # ── IMU propagation ───────────────────────────────────────────────────────
 
@@ -522,8 +583,12 @@ class MsckfVio(Node):
 
             self._static_buf.append((am.copy(), wm.copy()))
 
-            if self._last_imu_t is not None and (t - self._last_imu_t +
-                    len(self._static_buf) / 250.0) >= self._static_init_dur:
+            if self._static_start_t is None:
+                self._static_start_t = t
+
+            # Use actual elapsed sensor time for the collection window
+            elapsed = t - self._static_start_t
+            if elapsed >= self._static_init_dur:
                 # Enough data — compute biases from mean
                 am_mean = np.mean([s[0] for s in self._static_buf], axis=0)
                 wm_mean = np.mean([s[1] for s in self._static_buf], axis=0)
@@ -540,7 +605,7 @@ class MsckfVio(Node):
                 self._state.is_init = True
                 rpy = Rotation.from_quat(self._state.q).as_euler('xyz', degrees=True)
                 self.get_logger().info(
-                    f'Static init done ({len(self._static_buf)} samples)  '
+                    f'Static init done ({len(self._static_buf)} samples over {elapsed:.2f}s)  '
                     f'roll={rpy[0]:.1f}°  pitch={rpy[1]:.1f}°  yaw={rpy[2]:.1f}°  '
                     f'b_a=[{self._state.b_a[0]:.3f},{self._state.b_a[1]:.3f},{self._state.b_a[2]:.3f}]  '
                     f'b_g=[{self._state.b_g[0]:.4f},{self._state.b_g[1]:.4f},{self._state.b_g[2]:.4f}]')
@@ -559,13 +624,6 @@ class MsckfVio(Node):
         self._last_imu_t = t
         self._imu_count += 1
 
-        am = np.array([msg.linear_acceleration.x,
-                       msg.linear_acceleration.y,
-                       msg.linear_acceleration.z])
-        wm = np.array([msg.angular_velocity.x,
-                       msg.angular_velocity.y,
-                       msg.angular_velocity.z])
-
         self._propagate(am, wm, dt)
 
     def _propagate(self, am: np.ndarray, wm: np.ndarray, dt: float):
@@ -581,8 +639,9 @@ class MsckfVio(Node):
         Error-state transition (first-order discretisation):
           F = d(ẋ)/d(δx)  →  Φ ≈ I + F*dt
 
-        Process noise via G matrix (how IMU noise enters error state):
-          Q_d = G * (Q_c/dt) * G.T * dt
+        Process noise (first-order discretisation):
+          Q_d = G @ Q_c @ G.T * dt
+          (see "PROCESS NOISE DISCRETISATION" in module docstring)
         """
         s  = self._state
         R  = s.rotation_matrix()
@@ -614,7 +673,8 @@ class MsckfVio(Node):
         G[9:12, 6:9]  = np.eye(3)   # accel bias walk
         G[12:15, 9:12]= np.eye(3)   # gyro bias walk
 
-        Q_d = G @ (self._Q_c / dt) @ G.T * dt
+        # Discrete noise: Q_d = G @ Q_c @ G.T * dt
+        Q_d = G @ self._Q_c @ G.T * dt
 
         # Propagate full covariance (IMU + camera states)
         n   = s.n
@@ -634,17 +694,30 @@ class MsckfVio(Node):
     # ── Image callback (augment → track → update → marginalize) ──────────────
 
     def _img_cb(self, msg: Image):
-        if not self._state.is_init:
+        if not self._state.is_init or not self._cam_info_received:
             return
 
-        # Decode image to grayscale
+        # Decode image to grayscale — branch on encoding explicitly
         arr = np.frombuffer(msg.data, dtype=np.uint8)
+        enc = msg.encoding.lower()
         try:
-            img = arr.reshape(msg.height, msg.width, -1)
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-        except Exception:
-            # mono8
-            gray = arr.reshape(msg.height, msg.width)
+            if enc in ('mono8', '8uc1'):
+                gray = arr.reshape(msg.height, msg.width)
+            elif enc in ('bgr8', 'rgb8', 'bgra8', 'rgba8'):
+                channels = 4 if enc.endswith('a8') else 3
+                img = arr.reshape(msg.height, msg.width, channels)
+                code = cv2.COLOR_BGRA2GRAY if enc.startswith('bgra') else \
+                       cv2.COLOR_RGBA2GRAY if enc.startswith('rgba') else \
+                       cv2.COLOR_RGB2GRAY  if enc.startswith('rgb')  else \
+                       cv2.COLOR_BGR2GRAY
+                gray = cv2.cvtColor(img, code)
+            else:
+                # Fallback: assume 3-channel BGR
+                img = arr.reshape(msg.height, msg.width, -1)
+                gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        except Exception as e:
+            self.get_logger().warn(f'Image decode failed ({enc}): {e}')
+            return
 
         # 1. Augment state with current camera pose
         cam_id = self._state.augment()
@@ -696,7 +769,7 @@ class MsckfVio(Node):
             #      [0,   1/Z,-Y/Z²]]
             #
             #   Right-perturbation: R_C → R_C @ exp(skew(δφ_C))
-            #   δz_c / δφ_C = skew(z_c)           (see derivation in docstring)
+            #   δz_c / δφ_C = skew(z_c)           (see module docstring)
             #   δz_c / δp_C = -R_C.T               (world→camera rotation)
             #   δz_c / δp_f =  R_C.T
             #
@@ -833,6 +906,16 @@ class MsckfVio(Node):
         odom.pose.pose.orientation.y = float(s.q[1])
         odom.pose.pose.orientation.z = float(s.q[2])
         odom.pose.pose.orientation.w = float(s.q[3])
+
+        # Pose covariance (6×6 row-major): [x,y,z, rot_x,rot_y,rot_z]
+        # Map from EKF state indices [p(0:3), phi(6:9)]
+        cov6 = np.zeros(36)
+        pose_idx = [0, 1, 2, 6, 7, 8]
+        for i, src_i in enumerate(pose_idx):
+            for j, src_j in enumerate(pose_idx):
+                cov6[i * 6 + j] = s.P[src_i, src_j]
+        odom.pose.covariance = list(cov6)
+
         self._pub_odom.publish(odom)
 
         pose = PoseStamped()
@@ -840,14 +923,18 @@ class MsckfVio(Node):
         pose.pose   = odom.pose.pose
         self._path_msg.header.stamp = stamp
         self._path_msg.poses.append(pose)
+        if len(self._path_msg.poses) > 2000:   # cap memory
+            self._path_msg.poses.pop(0)
         self._pub_path.publish(self._path_msg)
 
     def _status_cb(self):
         s       = self._state
         elapsed = time.time() - self._start
         cov_p   = float(np.trace(s.P[:3, :3]))
+        cam_info = 'yes' if self._cam_info_received else 'no'
         self.get_logger().info(
             f'[{elapsed:.0f}s]  '
+            f'cam_info: {cam_info}  '
             f'Updates: {self._update_count}  '
             f'Feats used: {self._feat_count}  '
             f'Cam states: {len(s.cam_states)}  '
@@ -867,7 +954,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

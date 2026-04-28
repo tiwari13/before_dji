@@ -183,6 +183,7 @@ class ObstacleCluster:
     world_y: float = 0.0
     # YOLO detection class id (COCO: 0=person, 2=car, …)
     object_class: int = -1
+    max_points_history: int = 256
     
     def __post_init__(self):
         """Initialize derived properties"""
@@ -245,9 +246,54 @@ class ObstacleCluster:
         self.position_history.append((time.time(), self.center))
     
     def add_points(self, new_points: List[ObstaclePoint]):
-        """Add new points to cluster"""
+        """Add new points to cluster, keeping only a bounded recent set."""
         self.points.extend(new_points)
+        if len(self.points) > self.max_points_history:
+            self.points = self.points[-self.max_points_history:]
         self.update_properties()
+
+    def refresh_from_detection(self, detection: 'ObstacleCluster'):
+        """
+        Refresh this track from the latest detection snapshot.
+
+        Unlike add_points(), this replaces current geometry with the latest
+        observation so the track represents the obstacle's current shape rather
+        than an ever-growing history of old points.
+        """
+        self.points = list(detection.points[-self.max_points_history:])
+
+        # If the upstream detection has no raw points, preserve existing points
+        # but still refresh semantic / geometric metadata from the detection.
+        if self.points:
+            self.update_properties()
+        else:
+            self.center = Vector3D(detection.center.x, detection.center.y, detection.center.z)
+            self.center_x = detection.center_x
+            self.center_y = detection.center_y
+            self.world_x = detection.world_x
+            self.world_y = detection.world_y
+            self.min_distance = detection.min_distance
+            self.width = detection.width
+            self.height = detection.height
+            self.pixel_count = detection.pixel_count
+            self.bounding_box = detection.bounding_box
+            self.size_estimate = detection.size_estimate
+            self.last_updated = time.time()
+            self.position_history.append((time.time(), self.center))
+
+        # Refresh classification / fusion metadata from the current detection.
+        self.obstacle_type = detection.obstacle_type
+        self.confidence = detection.confidence
+        self.object_class = detection.object_class
+        self.sensor_sources = set(detection.sensor_sources)
+        self.sensor_confidence = dict(detection.sensor_confidence)
+        self.fusion_weight = detection.fusion_weight
+
+        # Carry over current threat estimate inputs when present.
+        self.collision_risk = detection.collision_risk
+        self.threat_level = detection.threat_level
+        self.priority_score = detection.priority_score
+        self.danger_level = detection.danger_level
     
     def merge_with(self, other: 'ObstacleCluster'):
         """Merge another cluster into this one"""
@@ -583,15 +629,18 @@ class ObstacleTracker:
         self.track_association_threshold = 2.0  # meters
         
     def update_tracks(self, detections: List[ObstacleCluster]) -> List[ObstacleCluster]:
-        """Update tracks with new detections using Hungarian algorithm"""
-        # Simple nearest neighbor association for now
-        # In production, use Hungarian algorithm or Joint Probabilistic Data Association
-        
-        updated_tracks = []
+        """
+        Update tracks with new detections using nearest-neighbour association.
+
+        This is not a Hungarian-algorithm tracker yet; unmatched tracks are
+        preserved until they exceed max_track_age.
+        """
         unmatched_detections = detections.copy()
+        matched_track_ids = set()
+        current_time = time.time()
         
         # Try to match detections to existing tracks
-        for track_id, track in self.tracks.items():
+        for track_id, track in list(self.tracks.items()):
             best_match = None
             best_distance = float('inf')
             
@@ -602,23 +651,22 @@ class ObstacleTracker:
                     best_distance = distance
             
             if best_match:
-                # Update existing track
-                track.add_points(best_match.points)
+                # Refresh existing track from the newest detection snapshot.
+                track.refresh_from_detection(best_match)
                 track.estimate_velocity()
                 track.is_stable = (time.time() - track.first_detected) > 1.0
-                updated_tracks.append(track)
+                matched_track_ids.add(track_id)
                 unmatched_detections.remove(best_match)
         
         # Create new tracks for unmatched detections
         for detection in unmatched_detections:
             detection.track_id = self.next_track_id
             detection.cluster_id = self.next_track_id
+            detection.last_updated = current_time
             self.tracks[self.next_track_id] = detection
-            updated_tracks.append(detection)
             self.next_track_id += 1
         
-        # Remove expired tracks
-        current_time = time.time()
+        # Remove expired tracks, but keep unmatched tracks alive until then.
         expired_track_ids = [
             track_id for track_id, track in self.tracks.items()
             if (current_time - track.last_updated) > self.max_track_age
@@ -627,7 +675,4 @@ class ObstacleTracker:
         for track_id in expired_track_ids:
             del self.tracks[track_id]
         
-        # Update tracks dictionary
-        self.tracks = {track.track_id: track for track in updated_tracks if track.track_id}
-        
-        return updated_tracks
+        return list(self.tracks.values())

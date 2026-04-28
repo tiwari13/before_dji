@@ -355,10 +355,14 @@ def main(args=None):
         rclpy.spin(node)
     except KeyboardInterrupt:
         print('\nGenerating comparison report...')
-        node.generate_report()
+        try:
+            node.generate_report()
+        except Exception as e:
+            print(f'Report generation failed: {e}')
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

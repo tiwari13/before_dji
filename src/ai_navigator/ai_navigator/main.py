@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Enhanced Smart Navigator - DJI Mavic 4 Pro Level
-Production-grade main entry point with comprehensive error handling,
-configuration management, and monitoring capabilities.
+Smart Navigator — main entry point.
+
+Handles ROS 2 argument separation, configuration loading, system monitoring,
+and clean lifecycle management.
 """
 
 import sys
@@ -13,558 +14,495 @@ import threading
 import logging
 import argparse
 from typing import Optional
+
 import yaml
 import psutil
 
-# ROS2 imports
 import rclpy
-from rclpy.node import Node
+from rclpy.utilities import remove_ros_args
 from rclpy.executors import MultiThreadedExecutor
-from rclpy.callback_groups import ReentrantCallbackGroup
 
-# Computer vision
 import cv2
 
-# Our enhanced modules
 from ai_navigator.smart_navigator import SmartNavigator
-from ai_navigator.navigation_params import NavigationParams, FlightMode
+from ai_navigator.navigation_params import FlightMode
 from ai_navigator.drone_state import DroneState
 
-# Global variables for signal handling
-navigator_node: Optional[SmartNavigator] = None
-executor: Optional[MultiThreadedExecutor] = None
-shutdown_event = threading.Event()
+# ── Globals touched by signal handler ─────────────────────────────────────────
+_executor: Optional[MultiThreadedExecutor] = None
+_shutdown_event = threading.Event()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# System monitor
+# ═══════════════════════════════════════════════════════════════════════════════
 
 class SystemMonitor:
-    """System health monitoring and performance tracking"""
-    
-    def __init__(self, logger):
-        self.logger = logger
-        self.start_time = time.time()
-        self.monitoring = True
-        self.monitor_thread = None
-        
-    def start_monitoring(self):
-        """Start system monitoring thread"""
-        self.monitor_thread = threading.Thread(target=self._monitoring_loop)
-        self.monitor_thread.daemon = True
-        self.monitor_thread.start()
-        self.logger.info("System monitoring started")
-    
-    def stop_monitoring(self):
-        """Stop system monitoring"""
-        self.monitoring = False
-        if self.monitor_thread:
-            self.monitor_thread.join(timeout=1.0)
-        self.logger.info("System monitoring stopped")
-    
-    def _monitoring_loop(self):
-        """Main monitoring loop"""
-        while self.monitoring and not shutdown_event.is_set():
-            try:
-                # System metrics
-                cpu_percent = psutil.cpu_percent(interval=1)
-                memory = psutil.virtual_memory()
-                
-                # Log warnings for high resource usage
-                if cpu_percent > 80:
-                    self.logger.warning(f"High CPU usage: {cpu_percent:.1f}%")
-                
-                if memory.percent > 80:
-                    self.logger.warning(f"High memory usage: {memory.percent:.1f}%")
-                
-                # Runtime metrics
-                runtime = time.time() - self.start_time
-                if runtime > 0 and int(runtime) % 300 == 0:  # Every 5 minutes
-                    self.logger.info(f"System runtime: {runtime/3600:.1f} hours")
-                
-                time.sleep(30)  # Check every 30 seconds
-                
-            except Exception as e:
-                self.logger.error(f"Monitoring error: {e}")
-                time.sleep(5)
+    """
+    Daemon thread that logs warnings when CPU or memory usage is high.
 
-def setup_logging(log_level: str = "INFO", log_file: Optional[str] = None) -> logging.Logger:
-    """Setup comprehensive logging system"""
-    
-    # Create logger
+    Uses psutil.cpu_percent(interval=None) — non-blocking; measures since last
+    call rather than sleeping for 1 s inside the psutil call itself.
+    """
+
+    POLL_INTERVAL = 30   # seconds between checks
+    RUNTIME_LOG_INTERVAL = 300  # seconds between runtime log entries
+
+    def __init__(self, logger: logging.Logger):
+        self._logger = logger
+        self._start  = time.monotonic()
+        self._stop   = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        # Prime the non-blocking measurement
+        psutil.cpu_percent(interval=None)
+
+    def start(self):
+        self._thread = threading.Thread(target=self._loop, daemon=True)
+        self._thread.start()
+        self._logger.info("System monitor started")
+
+    def stop(self):
+        self._stop.set()
+        if self._thread:
+            self._thread.join(timeout=2.0)
+        self._logger.info("System monitor stopped")
+
+    def _loop(self):
+        last_runtime_log = 0.0
+        while not self._stop.is_set() and not _shutdown_event.is_set():
+            try:
+                cpu   = psutil.cpu_percent(interval=None)
+                mem   = psutil.virtual_memory()
+                runtime = time.monotonic() - self._start
+
+                if cpu > 80:
+                    self._logger.warning(f"High CPU usage: {cpu:.1f}%")
+                if mem.percent > 80:
+                    self._logger.warning(f"High memory usage: {mem.percent:.1f}%")
+
+                if runtime - last_runtime_log >= self.RUNTIME_LOG_INTERVAL:
+                    self._logger.info(f"Runtime: {runtime/3600:.2f} h  "
+                                      f"CPU: {cpu:.1f}%  RAM: {mem.percent:.1f}%")
+                    last_runtime_log = runtime
+
+            except Exception as e:
+                self._logger.error(f"Monitor error: {e}")
+
+            self._stop.wait(timeout=self.POLL_INTERVAL)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Logging
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def setup_logging(log_level: str = "INFO",
+                  log_file: Optional[str] = None) -> logging.Logger:
     logger = logging.getLogger('smart_navigator')
     logger.setLevel(getattr(logging, log_level.upper()))
-    
-    # Clear any existing handlers
     logger.handlers.clear()
-    
-    # Create formatters
-    detailed_formatter = logging.Formatter(
+
+    fmt_simple   = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
+    fmt_detailed = logging.Formatter(
         '%(asctime)s - %(name)s - %(levelname)s - %(funcName)s:%(lineno)d - %(message)s'
     )
-    simple_formatter = logging.Formatter(
-        '%(asctime)s - %(levelname)s - %(message)s'
-    )
-    
-    # Console handler
-    console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(logging.INFO)
-    console_handler.setFormatter(simple_formatter)
-    logger.addHandler(console_handler)
-    
-    # File handler (if specified)
+
+    ch = logging.StreamHandler(sys.stdout)
+    ch.setLevel(logging.INFO)
+    ch.setFormatter(fmt_simple)
+    logger.addHandler(ch)
+
     if log_file:
         try:
-            os.makedirs(os.path.dirname(log_file), exist_ok=True)
-            file_handler = logging.FileHandler(log_file)
-            file_handler.setLevel(logging.DEBUG)
-            file_handler.setFormatter(detailed_formatter)
-            logger.addHandler(file_handler)
+            log_dir = os.path.dirname(log_file)
+            if log_dir:
+                os.makedirs(log_dir, exist_ok=True)
+            fh = logging.FileHandler(log_file)
+            fh.setLevel(logging.DEBUG)
+            fh.setFormatter(fmt_detailed)
+            logger.addHandler(fh)
             logger.info(f"Logging to file: {log_file}")
         except Exception as e:
-            logger.warning(f"Could not setup file logging: {e}")
-    
+            logger.warning(f"Could not set up file logging: {e}")
+
     return logger
 
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Configuration
+# ═══════════════════════════════════════════════════════════════════════════════
+
+_DEFAULT_CONFIG: dict = {
+    'navigation': {
+        'flight_mode':        'POSITION',
+        'takeoff_altitude':   -3.0,
+        'max_speed':           8.0,
+        'obstacle_threshold':  8.0,
+        'precision_hover':     True,
+    },
+    'sensors': {
+        'use_gps':      True,
+        'use_vision':   True,
+        'use_lidar':    True,
+        'sensor_fusion': True,
+    },
+    'safety': {
+        'max_altitude':      120.0,
+        'max_distance':      500.0,
+        'geofencing':         True,
+        'emergency_landing':  True,
+    },
+    'performance': {
+        'control_frequency': 100.0,
+        'vision_frequency':   30.0,
+        'planning_frequency': 20.0,
+    },
+    'activetrack': {
+        'enabled':               True,
+        'tracking_mode':        'TRACE',
+        'confidence_threshold':  0.7,
+    },
+}
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge override into base, returning a new dict."""
+    result = dict(base)
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
+
+
 def load_configuration(config_file: Optional[str] = None) -> dict:
-    """Load configuration from YAML file"""
-    
-    default_config = {
-        'navigation': {
-            'flight_mode': 'POSITION',
-            'takeoff_altitude': -3.0,
-            'max_speed': 8.0,
-            'obstacle_threshold': 8.0,
-            'precision_hover': True
-        },
-        'sensors': {
-            'use_gps': True,
-            'use_vision': True,
-            'use_lidar': True,
-            'sensor_fusion': True
-        },
-        'safety': {
-            'max_altitude': 120.0,
-            'max_distance': 500.0,
-            'geofencing': True,
-            'emergency_landing': True
-        },
-        'performance': {
-            'control_frequency': 100.0,
-            'vision_frequency': 30.0,
-            'planning_frequency': 20.0
-        },
-        'activetrack': {
-            'enabled': True,
-            'tracking_mode': 'TRACE',
-            'confidence_threshold': 0.7
-        }
-    }
-    
-    if config_file and os.path.exists(config_file):
+    """
+    Load YAML config and deep-merge over defaults.
+
+    A partial config file (e.g. only the 'navigation' section) merges
+    correctly without wiping unrelated default subkeys.
+    """
+    import copy
+    config = copy.deepcopy(_DEFAULT_CONFIG)
+
+    if config_file:
+        if not os.path.exists(config_file):
+            print(f"Warning: config file not found: {config_file} — using defaults")
+            return config
         try:
             with open(config_file, 'r') as f:
-                loaded_config = yaml.safe_load(f)
-                # Merge with default config
-                default_config.update(loaded_config)
-                print(f"✅ Configuration loaded from: {config_file}")
+                loaded = yaml.safe_load(f) or {}
+            config = _deep_merge(config, loaded)
+            print(f"Configuration loaded from: {config_file}")
         except Exception as e:
-            print(f"⚠️  Warning: Could not load config file {config_file}: {e}")
-            print("Using default configuration...")
+            print(f"Warning: could not load config file {config_file}: {e} — using defaults")
     else:
-        print("📋 Using default configuration")
-    
-    return default_config
+        print("Using default configuration")
+
+    return config
+
 
 def apply_configuration(navigator: SmartNavigator, config: dict):
-    """Apply configuration to navigator"""
-    try:
-        # Apply navigation parameters
-        nav_config = config.get('navigation', {})
-        if 'flight_mode' in nav_config:
-            mode_name = nav_config['flight_mode']
-            if hasattr(FlightMode, mode_name):
-                navigator.nav_params.flight_mode = getattr(FlightMode, mode_name)
-                navigator.flight_mode = navigator.nav_params.flight_mode
-        
-        if 'takeoff_altitude' in nav_config:
-            navigator.nav_params.takeoff_altitude = nav_config['takeoff_altitude']
-            navigator.takeoff_point.z = nav_config['takeoff_altitude']
-        
-        if 'max_speed' in nav_config:
-            navigator.nav_params.max_speed = nav_config['max_speed']
-        
-        if 'obstacle_threshold' in nav_config:
-            navigator.nav_params.obstacle_threshold = nav_config['obstacle_threshold']
-        
-        # Apply ActiveTrack configuration
-        activetrack_config = config.get('activetrack', {})
-        if activetrack_config.get('enabled', True):
-            if 'tracking_mode' in activetrack_config:
-                from ai_navigator.navigation_params import TrackingMode
-                mode_name = activetrack_config['tracking_mode']
-                if hasattr(TrackingMode, mode_name):
-                    navigator.nav_params.tracking_mode = getattr(TrackingMode, mode_name)
-                    navigator.tracking_mode = navigator.nav_params.tracking_mode
-        
-        # Apply safety parameters
-        safety_config = config.get('safety', {})
-        for param in ['max_altitude', 'max_distance']:
-            if param in safety_config:
-                setattr(navigator.nav_params.safety, param, safety_config[param])
-        
-        print("✅ Configuration applied successfully")
-        
-    except Exception as e:
-        print(f"⚠️  Warning: Error applying configuration: {e}")
+    """Apply loaded config to a live navigator node."""
+    nav_cfg = config.get('navigation', {})
 
-def signal_handler(signum, frame):
-    """Handle shutdown signals gracefully"""
-    global navigator_node, executor
-    
-    print(f"\n🛑 Received signal {signum}, initiating graceful shutdown...")
-    shutdown_event.set()
-    
-    if navigator_node:
-        try:
-            # Emergency land if in flight
-            if navigator_node.state not in [DroneState.INIT, DroneState.DISARMED, DroneState.LANDING]:
-                print("🚁 Drone in flight - initiating emergency landing...")
-                navigator_node.state = DroneState.EMERGENCY
-                time.sleep(2)  # Give time for emergency landing
-            
-            # Stop node
-            navigator_node.get_logger().info("Shutting down SmartNavigator...")
-            
-        except Exception as e:
-            print(f"Error during emergency shutdown: {e}")
-    
-    if executor:
-        executor.shutdown(timeout_sec=5.0)
-    
-    # Force exit after timeout
-    threading.Timer(10.0, lambda: os._exit(1)).start()
+    if 'flight_mode' in nav_cfg:
+        mode_name = nav_cfg['flight_mode']
+        if hasattr(FlightMode, mode_name):
+            navigator.nav_params.flight_mode = getattr(FlightMode, mode_name)
+            navigator.flight_mode = navigator.nav_params.flight_mode
+        else:
+            print(f"Warning: unknown flight_mode '{mode_name}' — ignored")
+
+    if 'takeoff_altitude' in nav_cfg:
+        navigator.nav_params.takeoff_altitude = nav_cfg['takeoff_altitude']
+        navigator.takeoff_point.z = nav_cfg['takeoff_altitude']
+
+    if 'max_speed' in nav_cfg:
+        navigator.nav_params.max_speed = nav_cfg['max_speed']
+
+    if 'obstacle_threshold' in nav_cfg:
+        navigator.nav_params.obstacle_threshold = nav_cfg['obstacle_threshold']
+
+    activetrack_cfg = config.get('activetrack', {})
+    if activetrack_cfg.get('enabled', True) and 'tracking_mode' in activetrack_cfg:
+        from ai_navigator.navigation_params import TrackingMode
+        mode_name = activetrack_cfg['tracking_mode']
+        if hasattr(TrackingMode, mode_name):
+            navigator.nav_params.tracking_mode = getattr(TrackingMode, mode_name)
+            navigator.tracking_mode = navigator.nav_params.tracking_mode
+        else:
+            print(f"Warning: unknown tracking_mode '{mode_name}' — ignored")
+
+    safety_cfg = config.get('safety', {})
+    for param in ['max_altitude', 'max_distance']:
+        if param in safety_cfg:
+            setattr(navigator.nav_params.safety, param, safety_cfg[param])
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Signal handling
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _signal_handler(signum, frame):
+    """
+    Set the shutdown event and cancel the executor.
+
+    Does NOT sleep, does NOT call rclpy.shutdown() — the main finally block
+    owns all cleanup.  Calling executor.cancel() causes spin() to return so
+    the normal cleanup path runs.
+    """
+    print(f"\nReceived signal {signum} — shutting down")
+    _shutdown_event.set()
+    if _executor is not None:
+        _executor.shutdown(wait=False)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Environment validation
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def validate_environment() -> bool:
-    """Validate runtime environment and dependencies"""
-    
-    print("🔍 Validating environment...")
-    
-    # Check Python version
+    print("Validating environment...")
+
     if sys.version_info < (3, 8):
-        print("❌ Python 3.8 or higher required")
+        print("Python 3.8 or higher required")
         return False
-    
-    # Check required packages
-    required_packages = [
+
+    required = [
         ('rclpy', 'ROS2 Python client library'),
-        ('cv2', 'OpenCV'),
+        ('cv2',   'OpenCV'),
         ('numpy', 'NumPy'),
-        ('yaml', 'PyYAML'),
-        ('psutil', 'System monitoring')
+        ('yaml',  'PyYAML'),
+        ('psutil','psutil'),
     ]
-    
-    missing_packages = []
-    for package, description in required_packages:
-        try:
-            __import__(package)
-        except ImportError:
-            missing_packages.append((package, description))
-    
-    if missing_packages:
-        print("❌ Missing required packages:")
-        for package, description in missing_packages:
-            print(f"   - {package}: {description}")
+    missing = [pkg for pkg, _ in required if not _importable(pkg)]
+    if missing:
+        print(f"Missing required packages: {', '.join(missing)}")
         return False
-    
-    # Check GPU availability for enhanced performance
-    try:
-        import torch
-        if torch.cuda.is_available():
-            print(f"✅ GPU acceleration available: {torch.cuda.get_device_name()}")
-        else:
-            print("⚠️  GPU not available - using CPU (performance may be limited)")
-    except ImportError:
-        print("⚠️  PyTorch not available - some AI features may be limited")
-    
-    # Check system resources
-    memory = psutil.virtual_memory()
-    if memory.total < 4 * 1024**3:  # 4GB
-        print("⚠️  Warning: Less than 4GB RAM available")
-    
-    cpu_count = psutil.cpu_count()
-    if cpu_count < 4:
-        print("⚠️  Warning: Less than 4 CPU cores available")
-    
-    print("✅ Environment validation complete")
+
+    mem = psutil.virtual_memory()
+    if mem.total < 4 * 1024**3:
+        print(f"Warning: only {mem.total // 1024**3} GB RAM — 4 GB recommended")
+
+    print("Environment OK")
     return True
 
-def create_navigator_node(config: dict) -> SmartNavigator:
-    """Create and configure navigator node"""
-    
-    print("🚁 Initializing Enhanced Smart Navigator...")
-    
-    # Create node
-    navigator = SmartNavigator()
-    
-    # Apply configuration
-    apply_configuration(navigator, config)
-    
-    # Log initialization
-    navigator.get_logger().info("🚁 Enhanced Smart Navigator initialized - DJI Mavic 4 Pro Level!")
-    navigator.get_logger().info(f"Flight Mode: {navigator.flight_mode.name}")
-    navigator.get_logger().info(f"Max Speed: {navigator.nav_params.max_speed} m/s")
-    navigator.get_logger().info(f"Takeoff Altitude: {navigator.nav_params.takeoff_altitude} m")
-    navigator.get_logger().info(f"Obstacle Threshold: {navigator.nav_params.obstacle_threshold} m")
-    
-    # Display capabilities
-    capabilities = [
-        "✅ Advanced Sensor Fusion (GPS + IMU + Vision + LIDAR)",
-        "✅ Precision Hovering (±5cm accuracy)",
-        "✅ ActiveTrack with 6 modes",
-        "✅ Terrain Following", 
-        "✅ Advanced Path Planning (A*, RRT*, DWA)",
-        "✅ Real-time Obstacle Tracking",
-        "✅ Multi-threaded Processing",
-        "✅ Professional Flight Modes",
-        "✅ Comprehensive Safety Systems"
-    ]
-    
-    print("\n🎯 Enhanced Capabilities:")
-    for capability in capabilities:
-        print(f"   {capability}")
-    
-    return navigator
+
+def _importable(name: str) -> bool:
+    try:
+        __import__(name)
+        return True
+    except ImportError:
+        return False
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Health checks
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def run_health_checks(navigator: SmartNavigator) -> bool:
-    """Run pre-flight health checks"""
-    
-    print("\n🏥 Running pre-flight health checks...")
-    
-    health_checks = []
-    
-    # Check sensor initialization
-    if hasattr(navigator, 'detection_model') and navigator.detection_model:
-        health_checks.append(("Computer Vision Model", True, "✅"))
-    else:
-        health_checks.append(("Computer Vision Model", False, "❌"))
-    
-    # Check parameter initialization
-    if navigator.nav_params:
-        health_checks.append(("Navigation Parameters", True, "✅"))
-    else:
-        health_checks.append(("Navigation Parameters", False, "❌"))
-    
-    # Check path planner
-    if navigator.path_planner:
-        health_checks.append(("Path Planner", True, "✅"))
-    else:
-        health_checks.append(("Path Planner", False, "❌"))
-    
-    # Check controllers
-    if navigator.precision_hover and navigator.active_track:
-        health_checks.append(("Advanced Controllers", True, "✅"))
-    else:
-        health_checks.append(("Advanced Controllers", False, "❌"))
-    
-    # Display results
-    all_healthy = True
-    for check_name, status, icon in health_checks:
-        print(f"   {icon} {check_name}: {'READY' if status else 'FAILED'}")
+    """
+    Check that navigator subsystems are instantiated.
+
+    These are existence checks, not operational readiness checks — they will
+    catch missing initialisation but not runtime sensor faults.
+    """
+    print("\nPre-flight checks:")
+
+    checks = [
+        ("nav_params",    bool(navigator.nav_params),
+         "Navigation parameters"),
+        ("path_planner",  bool(navigator.path_planner),
+         "Path planner"),
+        ("detection_model", bool(getattr(navigator, 'detection_model', None)),
+         "Detection model"),
+        ("controllers",   bool(getattr(navigator, 'precision_hover', None) and
+                               getattr(navigator, 'active_track',    None)),
+         "Controllers (precision_hover, active_track)"),
+    ]
+
+    all_ok = True
+    for key, status, label in checks:
+        mark = "OK  " if status else "FAIL"
+        print(f"  [{mark}] {label}")
         if not status:
-            all_healthy = False
-    
-    if all_healthy:
-        print("✅ All health checks passed - Ready for flight!")
-    else:
-        print("❌ Some health checks failed - Please review configuration")
-    
-    return all_healthy
+            all_ok = False
+
+    return all_ok
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# Main
+# ═══════════════════════════════════════════════════════════════════════════════
 
 def main(args=None):
     """
-    Enhanced main entry point for Smart Navigator
-    Supports multiple execution modes and comprehensive error handling
+    Entry point.
+
+    ROS 2 argument separation
+    -------------------------
+    ros2 run passes the full sys.argv (including --ros-args ...) to main().
+    rclpy.utilities.remove_ros_args() strips the --ros-args block so argparse
+    only sees application-level flags.  rclpy.init() then gets the original
+    argv (or the caller-supplied list) so it can parse the ROS args itself.
     """
-    global navigator_node, executor
-    
-    # Parse command line arguments
+    global _executor
+
+    # Separate ROS args from application args before argparse sees them
+    raw_args   = sys.argv[1:] if args is None else list(args)
+    app_args   = remove_ros_args(raw_args)   # strips --ros-args and everything after
+
     parser = argparse.ArgumentParser(
-        description='Enhanced Smart Navigator - DJI Mavic 4 Pro Level',
+        description='Smart Navigator',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python -m ai_navigator.main                          # Default mode
-  python -m ai_navigator.main --config config.yaml    # With custom config
-  python -m ai_navigator.main --mode SPORT            # Sport mode
-  python -m ai_navigator.main --activetrack TRACE     # ActiveTrack mode
-  python -m ai_navigator.main --log-level DEBUG       # Debug logging
-  python -m ai_navigator.main --log-file logs/nav.log # File logging
-        """
+  ros2 run ai_navigator autonomous_navigation
+  ros2 run ai_navigator autonomous_navigation -- --config config.yaml --mode SPORT
+  ros2 run ai_navigator autonomous_navigation -- --dry-run
+        """,
     )
-    
-    parser.add_argument('--config', '-c', type=str, 
-                       help='Configuration file path (YAML)')
-    parser.add_argument('--mode', '-m', type=str, 
-                       choices=['POSITION', 'SPORT', 'CINEMATIC', 'TRIPOD', 'ACTIVETRACK'],
-                       help='Flight mode')
+    parser.add_argument('--config', '-c', type=str,
+                        help='Configuration file path (YAML)')
+    parser.add_argument('--mode', '-m', type=str,
+                        choices=['POSITION', 'SPORT', 'CINEMATIC', 'TRIPOD', 'ACTIVETRACK'],
+                        help='Flight mode')
     parser.add_argument('--activetrack', '-t', type=str,
-                       choices=['SPOTLIGHT', 'PROFILE', 'TRACE', 'PARALLEL', 'CIRCLE', 'HELIX'],
-                       help='ActiveTrack mode')
-    parser.add_argument('--log-level', '-l', type=str, 
-                       choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
-                       default='INFO', help='Logging level')
+                        choices=['SPOTLIGHT', 'PROFILE', 'TRACE', 'PARALLEL', 'CIRCLE', 'HELIX'],
+                        help='ActiveTrack tracking mode')
+    parser.add_argument('--log-level', '-l', type=str,
+                        choices=['DEBUG', 'INFO', 'WARNING', 'ERROR'],
+                        default='INFO', help='Logging level')
     parser.add_argument('--log-file', type=str,
-                       help='Log file path')
+                        help='Log file path')
     parser.add_argument('--no-health-check', action='store_true',
-                       help='Skip pre-flight health checks')
+                        help='Skip pre-flight health checks')
+    parser.add_argument('--force', action='store_true',
+                        help='Continue even if health checks fail')
     parser.add_argument('--dry-run', action='store_true',
-                       help='Initialize but do not start flight')
-    
-    parsed_args = parser.parse_args(args)
-    
-    # Setup logging
-    logger = setup_logging(parsed_args.log_level, parsed_args.log_file)
-    
-    # Banner
-    print("\n" + "="*60)
-    print("🚁 ENHANCED SMART NAVIGATOR - DJI MAVIC 4 PRO LEVEL 🚁")
-    print("   Professional Autonomous Drone Navigation System")
-    print("="*60)
-    
+                        help='Initialise node but do not spin executor')
+
+    parsed = parser.parse_args(app_args)
+    logger = setup_logging(parsed.log_level, parsed.log_file)
+
+    print("=" * 55)
+    print("  Smart Navigator")
+    print("=" * 55)
+
+    monitor: Optional[SystemMonitor] = None
+    navigator_node: Optional[SmartNavigator] = None
+    ros_initialised = False
+
     try:
-        # Validate environment
         if not validate_environment():
-            print("❌ Environment validation failed")
             return 1
-        
-        # Load configuration
-        config = load_configuration(parsed_args.config)
-        
-        # Override with command line arguments
-        if parsed_args.mode:
-            config['navigation']['flight_mode'] = parsed_args.mode
-        if parsed_args.activetrack:
-            config['activetrack']['tracking_mode'] = parsed_args.activetrack
+
+        config = load_configuration(parsed.config)
+
+        if parsed.mode:
+            config['navigation']['flight_mode'] = parsed.mode
+        if parsed.activetrack:
+            config['activetrack']['tracking_mode'] = parsed.activetrack
             config['navigation']['flight_mode'] = 'ACTIVETRACK'
-        
-        # Initialize ROS2
-        print("\n🔧 Initializing ROS2...")
-        rclpy.init(args=args)
-        
-        # Setup signal handlers for graceful shutdown
-        signal.signal(signal.SIGINT, signal_handler)
-        signal.signal(signal.SIGTERM, signal_handler)
-        
-        # Create multi-threaded executor for better performance
-        executor = MultiThreadedExecutor(num_threads=4)
-        
-        # Create navigator node
-        navigator_node = create_navigator_node(config)
-        
-        # Add node to executor
-        executor.add_node(navigator_node)
-        
-        # Run health checks
-        if not parsed_args.no_health_check:
-            if not run_health_checks(navigator_node):
-                if not parsed_args.dry_run:
-                    response = input("\n⚠️  Health checks failed. Continue anyway? [y/N]: ")
-                    if response.lower() not in ['y', 'yes']:
-                        print("Aborting startup due to health check failures")
-                        return 1
-        
-        # Dry run mode
-        if parsed_args.dry_run:
-            print("\n🧪 Dry run mode - Node initialized but not starting flight")
-            print("Press Ctrl+C to exit")
-            try:
-                while not shutdown_event.is_set():
-                    time.sleep(1)
-            except KeyboardInterrupt:
-                pass
+
+        # rclpy.init receives the original argv so it can parse --ros-args
+        rclpy.init(args=raw_args)
+        ros_initialised = True
+
+        signal.signal(signal.SIGINT,  _signal_handler)
+        signal.signal(signal.SIGTERM, _signal_handler)
+
+        _executor = MultiThreadedExecutor(num_threads=4)
+
+        print("Initialising SmartNavigator node...")
+        navigator_node = SmartNavigator()
+        apply_configuration(navigator_node, config)
+        _executor.add_node(navigator_node)
+
+        navigator_node.get_logger().info(
+            f"Navigator ready — mode={navigator_node.flight_mode.name}  "
+            f"max_speed={navigator_node.nav_params.max_speed} m/s  "
+            f"takeoff_alt={navigator_node.nav_params.takeoff_altitude} m"
+        )
+
+        if not parsed.no_health_check:
+            healthy = run_health_checks(navigator_node)
+            if not healthy:
+                if parsed.force:
+                    print("Health checks failed — continuing because --force was given")
+                else:
+                    print("Health checks failed — aborting (use --force to override)")
+                    return 1
+
+        if parsed.dry_run:
+            print("Dry run — node initialised, not spinning. Ctrl+C to exit.")
+            _shutdown_event.wait()
             return 0
-        
-        # Start system monitoring
+
         monitor = SystemMonitor(logger)
-        monitor.start_monitoring()
-        
-        # Start the navigation system
-        print("\n🚀 Starting Enhanced Smart Navigator...")
-        print("   - Multi-threaded execution enabled")
-        print("   - Advanced sensor fusion active")
-        print("   - Professional flight modes ready")
-        print("   - Safety systems armed")
-        print("\n✈️  READY FOR AUTONOMOUS FLIGHT! ✈️")
-        print("\nPress Ctrl+C for graceful shutdown\n")
-        
-        # Run the executor
-        try:
-            executor.spin()
-        except KeyboardInterrupt:
-            logger.info("Keyboard interrupt received")
-        
-        # Stop monitoring
-        monitor.stop_monitoring()
-        
+        monitor.start()
+
+        print("Navigator running. Ctrl+C to stop.\n")
+        _executor.spin()
+
     except Exception as e:
         logger.error(f"Fatal error: {e}", exc_info=True)
-        print(f"\n❌ Fatal error occurred: {e}")
         return 1
-    
+
     finally:
-        # Cleanup
-        print("\n🧹 Cleaning up...")
-        
-        if navigator_node:
+        print("\nShutting down...")
+
+        if monitor is not None:
+            monitor.stop()
+
+        if navigator_node is not None:
             try:
-                # Emergency safety - ensure drone is landed
-                if hasattr(navigator_node, 'state') and navigator_node.state not in [
-                    DroneState.INIT, DroneState.DISARMED, DroneState.LANDING
-                ]:
-                    print("🛑 Emergency landing initiated...")
+                if (hasattr(navigator_node, 'state') and
+                        navigator_node.state not in
+                        [DroneState.INIT, DroneState.DISARMED, DroneState.LANDING]):
+                    print("Setting EMERGENCY state before shutdown")
                     navigator_node.state = DroneState.EMERGENCY
-                    time.sleep(3)  # Give time for emergency landing
-                
                 navigator_node.destroy_node()
             except Exception as e:
-                print(f"Error during node cleanup: {e}")
-        
-        if executor:
+                print(f"Node cleanup error: {e}")
+
+        if _executor is not None:
             try:
-                executor.shutdown(timeout_sec=5.0)
+                _executor.shutdown(wait=False)
             except Exception as e:
-                print(f"Error during executor shutdown: {e}")
-        
-        try:
-            rclpy.shutdown()
-        except Exception as e:
-            print(f"Error during ROS2 shutdown: {e}")
-        
-        # Close OpenCV windows
+                print(f"Executor shutdown error: {e}")
+
+        if ros_initialised and rclpy.ok():
+            try:
+                rclpy.shutdown()
+            except Exception as e:
+                print(f"ROS2 shutdown error: {e}")
+
         try:
             cv2.destroyAllWindows()
-        except:
+        except Exception:
             pass
-        
-        print("✅ Cleanup complete")
-        print("\n🚁 Enhanced Smart Navigator shutdown complete. Fly safe! 🚁\n")
-    
+
+        print("Shutdown complete")
+
     return 0
 
-# Entry points for different execution modes
+
+# ── Mode-specific entry points ─────────────────────────────────────────────────
+
 def main_default():
-    """Default entry point"""
     return main()
 
 def main_sport():
-    """Sport mode entry point"""
     return main(['--mode', 'SPORT'])
 
 def main_activetrack():
-    """ActiveTrack mode entry point"""
     return main(['--mode', 'ACTIVETRACK', '--activetrack', 'TRACE'])
 
 def main_cinematic():
-    """Cinematic mode entry point"""
     return main(['--mode', 'CINEMATIC'])
 
+
 if __name__ == '__main__':
-    exit_code = main()
-    sys.exit(exit_code)
+    sys.exit(main())

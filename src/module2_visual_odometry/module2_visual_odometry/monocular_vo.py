@@ -5,20 +5,34 @@ PHASE 2 — Step 6: Monocular Visual Odometry
 Improvements over Step 5 (epipolar geometry):
   1. KLT optical flow  — tracks features frame-to-frame without descriptor matching
   2. Keyframe selection — only estimate pose when enough parallax has accumulated
-  3. Triangulation      — reconstruct 3D points to get relative scale between keyframes
-  4. Scale normalization— divide t by median triangulated depth for scale consistency
+  3. Triangulation      — reconstruct 3D points for heuristic relative-scale normalisation
+  4. Scale normalisation— divide t by median triangulated depth (relative, NOT metric scale)
   5. Auto re-detection  — detect new features when tracked count drops too low
 
 Pipeline per frame:
   ┌─ Track existing features with KLT from prev frame
   ├─ Enough motion since last keyframe?
   │     YES → Essential Matrix + recoverPose (vs last keyframe)
-  │         → Triangulate 3D points
-  │         → Normalize t by median depth
+  │         → Triangulate 3D points in keyframe coords
+  │         → Divide t by median depth (heuristic relative scale)
   │         → Chain pose → update trajectory
   │         → Make current frame the new keyframe
   │     NO  → just update prev_gray / prev_pts
   └─ Feature count < MIN_FEATURES? → re-detect with Shi-Tomasi
+                                      (kf_gray/kf_pts preserved unless tracking fails)
+
+Frame convention (keyframe = view 1, current = view 2):
+  findEssentialMat(kf_pts, curr_pts, K)  ← kf=first, curr=second
+  recoverPose(E, kf_pts, curr_pts, K)    ← same order
+  R, t encode the transform:  p_curr = R @ p_kf + t
+  P1 = K[I|0]   (keyframe camera — view 1)
+  P2 = K[R|t]   (current camera — view 2)
+  triangulatePoints(P1, P2, kf_inliers, curr_inliers)
+
+Scale note:
+  Dividing t by median triangulated depth gives scale-consistent relative motion
+  between keyframe pairs. It does NOT produce metric (SI) scale — that requires
+  IMU integration (added in Step 9 / MSCKF).
 
 Run:
   ros2 run module2_visual_odometry monocular_vo
@@ -29,7 +43,7 @@ Ctrl+C generates a full report + trajectory plot.
 
 import rclpy
 from rclpy.node import Node
-from sensor_msgs.msg import Image
+from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import PoseStamped
 from px4_msgs.msg import VehicleLocalPosition
 from cv_bridge import CvBridge
@@ -37,13 +51,6 @@ from scipy.spatial.transform import Rotation
 import cv2
 import numpy as np
 import time
-
-# ── Camera intrinsics (Module 1 calibration) ─────────────────────────────────
-K = np.array([
-    [1397.22,    0.0,  960.0],
-    [   0.0, 1397.22,  540.0],
-    [   0.0,    0.0,    1.0]
-], dtype=np.float64)
 
 # ── Tuning parameters ─────────────────────────────────────────────────────────
 MAX_FEATURES   = 500    # Shi-Tomasi corners to detect
@@ -74,6 +81,10 @@ class MonocularVO(Node):
         super().__init__('monocular_vo')
         self.bridge = CvBridge()
 
+        # ── Intrinsics — populated from live CameraInfo ───────────────────────
+        self.K            = None   # set in _camera_info_cb
+        self._K_received  = False
+
         # ── Per-frame tracking state ──────────────────────────────────────────
         self.prev_gray = None        # last frame (grayscale)
         self.prev_pts  = None        # tracked points in prev_gray
@@ -97,17 +108,22 @@ class MonocularVO(Node):
         self.kf_count     = 0
         self.start_time   = time.time()
 
-        # ── Publisher for Step 8 EKF VIO ─────────────────────────────────────
+        # ── Publisher for Step 8 EKF VIO ──────────────────────────────────────
         self.pose_pub = self.create_publisher(
             PoseStamped, '/monocular_vo/pose', 10
         )
 
         # ── Subscriptions ─────────────────────────────────────────────────────
-        cam_topic = (
+        base = (
             '/world/default/model/x500_skydio_0/model'
-            '/camera_front/link/camera_link/sensor/IMX214/image'
+            '/camera_front/link/camera_link/sensor/IMX214'
         )
-        self.create_subscription(Image, cam_topic, self._image_cb, 10)
+        self.create_subscription(
+            CameraInfo, f'{base}/camera_info', self._camera_info_cb, 1
+        )
+        self.create_subscription(
+            Image, f'{base}/image', self._image_cb, 10
+        )
 
         sensor_qos = rclpy.qos.QoSProfile(
             reliability=rclpy.qos.ReliabilityPolicy.BEST_EFFORT,
@@ -126,6 +142,23 @@ class MonocularVO(Node):
         self.get_logger().info("=" * 60)
         self.get_logger().info("PHASE 2  Step 6: Monocular Visual Odometry")
         self.get_logger().info("=" * 60)
+        self.get_logger().info("Waiting for CameraInfo...")
+
+    # ── CameraInfo — populate K once ──────────────────────────────────────────
+    def _camera_info_cb(self, msg):
+        if self._K_received:
+            return
+        self.K = np.array([
+            [msg.k[0], 0.0,      msg.k[2]],
+            [0.0,      msg.k[4], msg.k[5]],
+            [0.0,      0.0,      1.0     ],
+        ], dtype=np.float64)
+        self._K_received = True
+        self.get_logger().info(
+            f"CameraInfo received: fx={msg.k[0]:.2f} fy={msg.k[4]:.2f} "
+            f"cx={msg.k[2]:.2f} cy={msg.k[5]:.2f} "
+            f"res={msg.width}x{msg.height}"
+        )
         self.get_logger().info("Using KLT tracking + keyframe selection")
         self.get_logger().info("Fly a circle with circle_flight, then Ctrl+C")
 
@@ -138,6 +171,9 @@ class MonocularVO(Node):
 
     # ── Main image callback ───────────────────────────────────────────────────
     def _image_cb(self, msg):
+        if not self._K_received:
+            return   # intrinsics not ready yet
+
         gray = cv2.cvtColor(
             self.bridge.imgmsg_to_cv2(msg, 'bgr8'),
             cv2.COLOR_BGR2GRAY
@@ -146,39 +182,48 @@ class MonocularVO(Node):
 
         # ── First frame: initialise ───────────────────────────────────────────
         if self.prev_gray is None:
+            pts = self._detect(gray)
+            if len(pts) == 0:
+                return   # no features yet — wait
             self.prev_gray = gray
-            self.prev_pts  = self._detect(gray)
+            self.prev_pts  = pts
             self.kf_gray   = gray
-            self.kf_pts    = self.prev_pts.copy()
+            self.kf_pts    = pts.copy()
             return
 
         # ── Step 1: KLT tracking ──────────────────────────────────────────────
+        # Guard: prev_pts must be valid and have enough points before calling KLT
+        if self.prev_pts is None or len(self.prev_pts) < MIN_MATCHES:
+            self.get_logger().warn(
+                f'Tracking: prev_pts insufficient ({len(self.prev_pts) if self.prev_pts is not None else 0} pts) — resetting'
+            )
+            self._reset_tracking(gray)
+            return
+
         curr_pts, status, _ = cv2.calcOpticalFlowPyrLK(
             self.prev_gray, gray, self.prev_pts, None, **LK_PARAMS
         )
 
-        # Keep only successfully tracked points
+        # Guard: KLT failed entirely
         if curr_pts is None or status is None:
-            self.prev_gray = gray
-            self.prev_pts  = self._detect(gray)
-            self.kf_gray   = gray
-            self.kf_pts    = self.prev_pts.copy()
+            self._reset_tracking(gray)
             return
 
         ok           = status.ravel() == 1
         curr_pts_ok  = curr_pts[ok]
-        prev_pts_ok  = self.prev_pts[ok]
+        prev_pts_ok  = self.prev_pts[ok]   # noqa: F841 — kept for symmetry
 
         if len(curr_pts_ok) < MIN_MATCHES:
-            # Lost tracking — re-initialise
-            self.prev_gray = gray
-            self.prev_pts  = self._detect(gray)
-            self.kf_gray   = gray
-            self.kf_pts    = self.prev_pts.copy()
+            self.get_logger().warn(
+                f'Tracking lost: only {len(curr_pts_ok)} pts survived KLT '
+                f'(need {MIN_MATCHES}) — resetting'
+            )
+            self._reset_tracking(gray)
             return
 
         # ── Step 2: measure motion since last keyframe ────────────────────────
         # Re-track keyframe features into the current frame
+        # Convention: kf = reference (train), curr = query
         kf_curr, kf_status, _ = cv2.calcOpticalFlowPyrLK(
             self.kf_gray, gray, self.kf_pts, None, **LK_PARAMS
         )
@@ -191,72 +236,94 @@ class MonocularVO(Node):
                 np.linalg.norm(kf_curr_ok - kf_prev_ok, axis=1)
             )) if len(kf_curr_ok) > 0 else 0.0
         else:
-            mean_flow, kf_curr_ok, kf_prev_ok = 0.0, np.zeros((0,2)), np.zeros((0,2))
+            mean_flow, kf_curr_ok, kf_prev_ok = 0.0, np.zeros((0, 2)), np.zeros((0, 2))
 
         # ── Step 3: new keyframe? ─────────────────────────────────────────────
         if mean_flow >= MIN_FLOW and len(kf_curr_ok) >= MIN_MATCHES:
             self._process_keyframe(gray, kf_curr_ok, kf_prev_ok)
 
         # ── Step 4: re-detect if features running low ─────────────────────────
+        # Preserve kf_gray/kf_pts — only reset prev tracking, not the keyframe.
         if len(curr_pts_ok) < MIN_FEATURES:
-            self.prev_pts = self._detect(gray)
-            self.kf_gray  = gray
-            self.kf_pts   = self.prev_pts.copy()
+            new_pts = self._detect(gray)
+            if len(new_pts) > 0:
+                self.prev_pts = new_pts
+            else:
+                self.prev_pts = curr_pts_ok.reshape(-1, 1, 2)
         else:
             self.prev_pts = curr_pts_ok.reshape(-1, 1, 2)
 
         self.prev_gray = gray
 
     # ── Process a keyframe pair ───────────────────────────────────────────────
-    def _process_keyframe(self, gray, curr_pts, prev_pts):
+    def _process_keyframe(self, gray, curr_pts, kf_pts):
         """
-        curr_pts — tracked positions of keyframe features in the current frame
-        prev_pts — those same features' positions in the keyframe
+        kf_pts   — feature positions in the KEYFRAME  (view 1 / reference)
+        curr_pts — those same features tracked into the CURRENT frame (view 2)
+
+        Frame convention: keyframe = first view, current = second view.
+          findEssentialMat(kf_pts, curr_pts, K)
+          recoverPose(E, kf_pts, curr_pts, K)
+          R, t: p_curr = R @ p_kf + t   (kf → current)
+          P1 = K[I|0]   (keyframe camera)
+          P2 = K[R|t]   (current camera)
+          triangulatePoints(P1, P2, kf_inliers, curr_inliers)
         """
         # ── Essential Matrix (RANSAC) ─────────────────────────────────────────
+        # kf = first view, curr = second view — consistent throughout
         E, mask = cv2.findEssentialMat(
-            curr_pts, prev_pts, K,
+            kf_pts, curr_pts, self.K,
             method=cv2.RANSAC, prob=0.999, threshold=1.0,
         )
         if E is None or mask is None:
+            self.get_logger().warn('findEssentialMat returned None — skipping keyframe')
             return
 
         n_inliers    = int(mask.sum())
-        inlier_ratio = n_inliers / len(curr_pts)
+        inlier_ratio = n_inliers / len(kf_pts)
 
         if inlier_ratio < MIN_INLIER_R or n_inliers < MIN_MATCHES:
+            self.get_logger().warn(
+                f'Keyframe rejected: inlier_ratio={inlier_ratio:.2f} '
+                f'n_inliers={n_inliers} (thresholds: {MIN_INLIER_R:.2f} / {MIN_MATCHES})'
+            )
             return
 
         # ── Recover R, t ──────────────────────────────────────────────────────
+        # R, t: transform from keyframe to current (kf → curr)
         _, R, t, pose_mask = cv2.recoverPose(
-            E, curr_pts, prev_pts, K, mask=mask
+            E, kf_pts, curr_pts, self.K, mask=mask
         )
 
-        # ── Triangulate to get scale ──────────────────────────────────────────
-        # Projection matrices: P1 = K[I|0],  P2 = K[R|t]
-        P1 = K @ np.hstack([np.eye(3),    np.zeros((3, 1))])
-        P2 = K @ np.hstack([R,             t              ])
+        # ── Triangulate to estimate relative scale ────────────────────────────
+        # P1 = keyframe (view 1), P2 = current (view 2)
+        P1 = self.K @ np.hstack([np.eye(3), np.zeros((3, 1))])
+        P2 = self.K @ np.hstack([R, t])
 
-        inlier_curr = curr_pts[mask.ravel() == 255].T   # (2, N)
-        inlier_prev = prev_pts[mask.ravel() == 255].T
+        # pose_mask == 255 for cheirality-passing inliers
+        inlier_kf   = kf_pts  [pose_mask.ravel() == 255].T   # (2, N) — keyframe pts
+        inlier_curr = curr_pts[pose_mask.ravel() == 255].T   # (2, N) — current pts
 
-        if inlier_curr.shape[1] >= 4:
-            pts4d  = cv2.triangulatePoints(P1, P2, inlier_prev, inlier_curr)
+        scale = 1.0
+        if inlier_kf.shape[1] >= 4:
+            pts4d  = cv2.triangulatePoints(P1, P2, inlier_kf, inlier_curr)
             pts3d  = pts4d[:3] / (pts4d[3] + 1e-8)        # (3, N) homogeneous → 3D
-            depths = pts3d[2, pts3d[2] > 0.1]              # positive depths only
-            scale  = float(np.median(depths)) if len(depths) > 3 else 1.0
-        else:
-            scale = 1.0
+            # Depths are in keyframe camera coords (Z-forward)
+            depths = pts3d[2, pts3d[2] > 0.1]
+            if len(depths) > 3:
+                # Heuristic relative-scale normalisation — NOT metric scale.
+                # Divides t by median reconstructed depth so motion magnitude
+                # is consistent between keyframe pairs, but has no SI unit.
+                scale = float(np.median(depths))
 
         # ── Update global pose ────────────────────────────────────────────────
-        # Scale normalizes translation to metric-like units (relative scale)
         if scale > 0.01:
             t_scaled = t / scale
         else:
             t_scaled = t
 
-        # Compose:  t_world += R_world @ t_scaled
-        #           R_world  = R @ R_world
+        # Accumulate pose — translation MUST use the pre-update R_world so the
+        # delta is rotated into the current world frame before R_world advances.
         self.t_world = self.t_world + self.R_world @ t_scaled
         self.R_world = R @ self.R_world
 
@@ -301,7 +368,7 @@ class MonocularVO(Node):
         pose_msg.pose.orientation.w = float(q[3])
         self.pose_pub.publish(pose_msg)
 
-        # ── New keyframe ──────────────────────────────────────────────────────
+        # ── Advance keyframe ──────────────────────────────────────────────────
         self.kf_gray = gray
         self.kf_pts  = curr_pts.reshape(-1, 1, 2)
 
@@ -312,6 +379,16 @@ class MonocularVO(Node):
         if pts is None:
             return np.zeros((0, 1, 2), dtype=np.float32)
         return pts
+
+    def _reset_tracking(self, gray):
+        """Full tracking reset — also resets the keyframe."""
+        pts = self._detect(gray)
+        if len(pts) == 0:
+            self.get_logger().warn('Feature detection returned zero points during reset')
+        self.prev_gray = gray
+        self.prev_pts  = pts if len(pts) > 0 else np.zeros((0, 1, 2), dtype=np.float32)
+        self.kf_gray   = gray
+        self.kf_pts    = self.prev_pts.copy()
 
     # ── Status timer ──────────────────────────────────────────────────────────
     def _status_cb(self):
@@ -336,10 +413,86 @@ class MonocularVO(Node):
 
     # ── Report ────────────────────────────────────────────────────────────────
     def generate_report(self):
-        import matplotlib
-        matplotlib.use('Agg')
-        import matplotlib.pyplot as plt
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+        except Exception as e:
+            print(f"Matplotlib unavailable — skipping plots: {e}")
+            self._print_text_report()
+            return
 
+        self._print_text_report()
+
+        if not self.keyframe_log:
+            return
+
+        ratios = [k['inlier_ratio']  for k in self.keyframe_log]
+        scales = [k['scale']         for k in self.keyframe_log]
+        times  = [k['time']          for k in self.keyframe_log]
+        n_pts  = [k['n_pts']         for k in self.keyframe_log]
+        traj   = np.array(self.trajectory)
+
+        try:
+            fig, axes = plt.subplots(2, 2, figsize=(16, 12))
+
+            # 1. Trajectory top-down
+            ax = axes[0, 0]
+            if len(traj) > 1:
+                ax.plot(traj[:, 0], traj[:, 1], 'b-', lw=1.5, label='Monocular VO')
+                ax.scatter(*traj[0, :2],  c='g', s=100, zorder=5, label='Start')
+                ax.scatter(*traj[-1, :2], c='r', s=100, marker='x', zorder=5, label='End')
+            if len(self.gt_trajectory) > 1:
+                gt = np.array(self.gt_trajectory)
+                ax.plot(gt[:, 0], gt[:, 1], 'r--', lw=1.5, alpha=0.7,
+                        label='GT (NED) — scale not comparable')
+            ax.set_xlabel('X'); ax.set_ylabel('Y')
+            ax.set_title('Trajectory (top-down)\nVO scale is relative, not metric')
+            ax.legend(fontsize=8); ax.grid(True); ax.set_aspect('equal')
+
+            # 2. Inlier ratio over time
+            ax2 = axes[0, 1]
+            ax2.plot(times, [r*100 for r in ratios], 'g-', lw=1.5)
+            ax2.axhline(40, color='r', ls='--', alpha=0.5, label='40% floor')
+            ax2.set_xlabel('Time (s)'); ax2.set_ylabel('Inlier Ratio (%)')
+            ax2.set_title('RANSAC Quality Over Time')
+            ax2.legend(); ax2.grid(True); ax2.set_ylim(0, 105)
+
+            # 3. Scale over time (consistency check)
+            ax3 = axes[1, 0]
+            ax3.plot(times, scales, 'm-', lw=1.5)
+            ax3.axhline(np.mean(scales), color='k', ls='--',
+                        label=f'Mean={np.mean(scales):.2f}')
+            ax3.fill_between(times,
+                             np.mean(scales) - np.std(scales),
+                             np.mean(scales) + np.std(scales),
+                             alpha=0.2, color='m', label=f'±1σ={np.std(scales):.2f}')
+            ax3.set_xlabel('Time (s)'); ax3.set_ylabel('Relative Scale (depth units)')
+            ax3.set_title('Scale Consistency\n(flat = consistent; NOT metric)')
+            ax3.legend(); ax3.grid(True)
+
+            # 4. Feature count over time
+            ax4 = axes[1, 1]
+            ax4.plot(times, n_pts, 'steelblue', lw=1.5)
+            ax4.axhline(MIN_FEATURES, color='r', ls='--',
+                        label=f'Re-detect threshold ({MIN_FEATURES})')
+            ax4.set_xlabel('Time (s)'); ax4.set_ylabel('Tracked Features')
+            ax4.set_title('Feature Count per Keyframe')
+            ax4.legend(); ax4.grid(True)
+
+            plt.suptitle('Phase 2 — Step 6: Monocular Visual Odometry',
+                         fontsize=14, fontweight='bold')
+            plt.tight_layout()
+            out = 'monocular_vo_step6.png'
+            plt.savefig(out, dpi=150, bbox_inches='tight')
+            print(f"\n  Saved: {out}")
+
+        except Exception as e:
+            print(f"  Plot generation failed: {e}")
+
+        print("=" * 70 + "\n")
+
+    def _print_text_report(self):
         print("\n" + "=" * 70)
         print("PHASE 2 — Step 6: MONOCULAR VO REPORT")
         print("=" * 70)
@@ -348,11 +501,11 @@ class MonocularVO(Node):
             print("No keyframes processed.")
             return
 
-        elapsed  = time.time() - self.start_time
-        ratios   = [k['inlier_ratio']  for k in self.keyframe_log]
-        scales   = [k['scale']         for k in self.keyframe_log]
-        times    = [k['time']          for k in self.keyframe_log]
-        n_pts    = [k['n_pts']         for k in self.keyframe_log]
+        elapsed = time.time() - self.start_time
+        ratios  = [k['inlier_ratio']  for k in self.keyframe_log]
+        scales  = [k['scale']         for k in self.keyframe_log]
+        n_pts   = [k['n_pts']         for k in self.keyframe_log]
+        traj    = np.array(self.trajectory)
 
         print(f"\n  Runtime:             {elapsed:.1f}s")
         print(f"  Frames processed:    {self.frame_count}")
@@ -360,84 +513,27 @@ class MonocularVO(Node):
         print(f"  KF rate:             {self.kf_count/elapsed:.2f} KF/s")
         print(f"\n  Inlier ratio:        {np.mean(ratios)*100:.1f}% avg")
         print(f"  Scale consistency:   std={np.std(scales):.3f}  "
-              f"(lower = more consistent)")
+              f"(lower = more consistent between keyframe pairs)")
         print(f"  Features tracked:    {np.mean(n_pts):.0f} avg per KF")
 
-        traj = np.array(self.trajectory)
         if len(traj) > 1:
-            total_dist = np.sum(
-                np.linalg.norm(np.diff(traj, axis=0), axis=1)
-            )
-            print(f"  Path length (VO):    {total_dist:.2f} units")
+            total_dist = np.sum(np.linalg.norm(np.diff(traj, axis=0), axis=1))
+            print(f"  Path length (VO):    {total_dist:.2f} relative units")
 
-        # Scale consistency assessment
         scale_std = np.std(scales)
         if scale_std < 1.0:
-            verdict = "EXCELLENT — scale very consistent between keyframes"
+            verdict = "EXCELLENT — scale consistent between keyframes"
         elif scale_std < 3.0:
-            verdict = "GOOD — minor scale drift, acceptable for short flights"
+            verdict = "GOOD — minor scale variation, acceptable for short flights"
         else:
-            verdict = "MODERATE — scale drift present, IMU will fix this in Step 9"
+            verdict = "MODERATE — scale varies; IMU integration (Step 9) will fix this"
         print(f"\n  Assessment: {verdict}")
 
         print(f"\n  Key insight:")
-        print(f"    Scale is RELATIVE — each keyframe normalizes by median depth.")
-        print(f"    Drift still accumulates over time. IMU integration (Step 9)")
-        print(f"    provides absolute metric scale from accelerometer integration.")
-
-        # ── Plots ─────────────────────────────────────────────────────────────
-        fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-
-        # 1. Trajectory top-down
-        ax = axes[0, 0]
-        if len(traj) > 1:
-            ax.plot(traj[:, 0], traj[:, 1], 'b-', lw=1.5, label='Monocular VO')
-            ax.scatter(*traj[0, :2],  c='g', s=100, zorder=5, label='Start')
-            ax.scatter(*traj[-1, :2], c='r', s=100, marker='x', zorder=5, label='End')
-        if len(self.gt_trajectory) > 1:
-            gt = np.array(self.gt_trajectory)
-            ax.plot(gt[:, 0], gt[:, 1], 'r--', lw=1.5, alpha=0.7, label='GT (NED)')
-        ax.set_xlabel('X'); ax.set_ylabel('Y')
-        ax.set_title('Trajectory (top-down)\nVO scale is relative to GT')
-        ax.legend(fontsize=8); ax.grid(True); ax.set_aspect('equal')
-
-        # 2. Inlier ratio over time
-        ax2 = axes[0, 1]
-        ax2.plot(times, [r*100 for r in ratios], 'g-', lw=1.5)
-        ax2.axhline(40, color='r', ls='--', alpha=0.5, label='40% floor')
-        ax2.set_xlabel('Time (s)'); ax2.set_ylabel('Inlier Ratio (%)')
-        ax2.set_title('RANSAC Quality Over Time')
-        ax2.legend(); ax2.grid(True); ax2.set_ylim(0, 105)
-
-        # 3. Scale over time (consistency check)
-        ax3 = axes[1, 0]
-        ax3.plot(times, scales, 'm-', lw=1.5)
-        ax3.axhline(np.mean(scales), color='k', ls='--',
-                    label=f'Mean={np.mean(scales):.2f}')
-        ax3.fill_between(times,
-                         np.mean(scales) - np.std(scales),
-                         np.mean(scales) + np.std(scales),
-                         alpha=0.2, color='m', label=f'±1σ={np.std(scales):.2f}')
-        ax3.set_xlabel('Time (s)'); ax3.set_ylabel('Triangulated Scale')
-        ax3.set_title('Scale Consistency\n(flat = good; IMU fixes drift)')
-        ax3.legend(); ax3.grid(True)
-
-        # 4. Feature count over time
-        ax4 = axes[1, 1]
-        ax4.plot(times, n_pts, 'steelblue', lw=1.5)
-        ax4.axhline(MIN_FEATURES, color='r', ls='--',
-                    label=f'Re-detect threshold ({MIN_FEATURES})')
-        ax4.set_xlabel('Time (s)'); ax4.set_ylabel('Tracked Features')
-        ax4.set_title('Feature Count per Keyframe')
-        ax4.legend(); ax4.grid(True)
-
-        plt.suptitle('Phase 2 — Step 6: Monocular Visual Odometry',
-                     fontsize=14, fontweight='bold')
-        plt.tight_layout()
-        out = 'monocular_vo_step6.png'
-        plt.savefig(out, dpi=150, bbox_inches='tight')
-        print(f"\n  Saved: {out}")
-        print("=" * 70 + "\n")
+        print(f"    Scale is RELATIVE — each keyframe normalises by median depth.")
+        print(f"    This is NOT metric scale. Drift still accumulates over time.")
+        print(f"    IMU integration (Step 9 / MSCKF) provides absolute metric scale.")
+        print(f"    GT overlay is educational only — axes are not directly comparable.")
 
 
 def main(args=None):
@@ -447,10 +543,14 @@ def main(args=None):
         rclpy.spin(node)
     except KeyboardInterrupt:
         print("\nGenerating report...")
-        node.generate_report()
+        try:
+            node.generate_report()
+        except Exception as e:
+            print(f"Report generation failed: {e}")
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':

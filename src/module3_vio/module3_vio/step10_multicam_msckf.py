@@ -83,7 +83,7 @@ from rclpy.node import Node
 from rclpy.qos import QoSProfile, ReliabilityPolicy, DurabilityPolicy, HistoryPolicy
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 
-from sensor_msgs.msg import Imu, Image
+from sensor_msgs.msg import Imu, Image, CameraInfo
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PoseStamped
 from px4_msgs.msg import VehicleLocalPosition
@@ -94,11 +94,6 @@ from scipy.stats import chi2
 import cv2
 import time
 from collections import defaultdict
-
-# ── Camera intrinsics (both cameras identical — same OakD-Lite model) ─────────
-FX = FY = 465.74
-CX, CY  = 320.0, 180.0
-IMG_W, IMG_H = 640, 480
 
 # ── Camera-IMU extrinsics ──────────────────────────────────────────────────────
 #
@@ -210,8 +205,9 @@ class CameraTracker:
         criteria = (cv2.TERM_CRITERIA_EPS | cv2.TERM_CRITERIA_COUNT, 30, 0.01),
     )
 
-    def __init__(self, cam_label: str):
+    def __init__(self, cam_label: str, intrinsics: dict):
         self.label        = cam_label
+        self._intr        = intrinsics
         self._next_fid    = 0
         self._prev_img    = None
         self._pts         = None   # Nx1x2 float32
@@ -247,7 +243,10 @@ class CameraTracker:
         ok = (st_f.flatten() == 1) & (st_b.flatten() == 1) & (fb_err < 2.0)
 
         nx, ny = next_pts[:, 0, 0], next_pts[:, 0, 1]
-        ok &= (nx >= 5) & (nx < IMG_W - 5) & (ny >= 5) & (ny < IMG_H - 5)
+        ok &= (
+            (nx >= 5) & (nx < self._intr['img_w'] - 5) &
+            (ny >= 5) & (ny < self._intr['img_h'] - 5)
+        )
 
         kept_pts, kept_ids = [], []
         for i, (fid, tracked) in enumerate(zip(self._ids, ok)):
@@ -256,8 +255,8 @@ class CameraTracker:
                 py = float(next_pts[i, 0, 1])
                 self.tracks[fid].append({
                     'cam_state_id': cam_state_id,
-                    'u': (px - CX) / FX,
-                    'v': (py - CY) / FY,
+                    'u': (px - self._intr['cx']) / self._intr['fx'],
+                    'v': (py - self._intr['cy']) / self._intr['fy'],
                 })
                 if len(self.tracks[fid]) >= MAX_TRACK_LEN:
                     lost_ids.append(fid)
@@ -295,8 +294,8 @@ class CameraTracker:
             self._next_fid += 1
             self.tracks[fid].append({
                 'cam_state_id': cam_state_id,
-                'u': (px - CX) / FX,
-                'v': (py - CY) / FY,
+                'u': (px - self._intr['cx']) / self._intr['fx'],
+                'v': (py - self._intr['cy']) / self._intr['fy'],
             })
             if self._pts is None:
                 self._pts = pt.reshape(1, 1, 2)
@@ -518,8 +517,12 @@ class MultiCamMsckfVio(Node):
         super().__init__('multicam_msckf')
 
         self._state   = MultiCamMsckfState()
-        self._tracker0 = CameraTracker('cam0')   # front
-        self._tracker1 = CameraTracker('cam1')   # back
+        self._cam0_intr = {'fx': None, 'fy': None, 'cx': None, 'cy': None, 'img_w': None, 'img_h': None}
+        self._cam1_intr = {'fx': None, 'fy': None, 'cx': None, 'cy': None, 'img_w': None, 'img_h': None}
+        self._cam0_info_received = False
+        self._cam1_info_received = False
+        self._tracker0: CameraTracker | None = None   # front
+        self._tracker1: CameraTracker | None = None   # back
         self._stereo   = StereoMatcher()
 
         # stereo_links[fid0] = fid1  — cross-camera feature associations
@@ -535,6 +538,7 @@ class MultiCamMsckfVio(Node):
         # Static IMU initialisation buffers
         self._static_buf: list[tuple] = []
         self._static_init_done = False
+        self._static_start_t: float | None = None
         self._static_init_dur  = 2.0
 
         self._Q_c = np.diag([
@@ -557,6 +561,8 @@ class MultiCamMsckfVio(Node):
 
         # ── IMU subscriber ─────────────────────────────────────────────────────
         self.create_subscription(Imu, '/imu0', self._imu_cb, 50)
+        self.create_subscription(CameraInfo, '/cam0/camera_info', self._cam0_info_cb, 1)
+        self.create_subscription(CameraInfo, '/cam1/camera_info', self._cam1_info_cb, 1)
 
         # ── Synchronised stereo image subscriber ──────────────────────────────
         # ApproximateTimeSynchronizer matches cam0 and cam1 frames that arrive
@@ -590,6 +596,39 @@ class MultiCamMsckfVio(Node):
             f'Pixel σ: {PIXEL_STD} px  Max feats/cam: {MAX_FEATURES}')
         self.get_logger().info(
             f'Stereo gives METRIC SCALE — no monocular scale ambiguity')
+        self.get_logger().info('Waiting for /cam0/camera_info and /cam1/camera_info...')
+
+    def _cam0_info_cb(self, msg: CameraInfo):
+        if self._cam0_info_received:
+            return
+        self._cam0_intr.update({
+            'fx': float(msg.k[0]), 'fy': float(msg.k[4]),
+            'cx': float(msg.k[2]), 'cy': float(msg.k[5]),
+            'img_w': int(msg.width), 'img_h': int(msg.height),
+        })
+        self._cam0_info_received = True
+        self._tracker0 = CameraTracker('cam0', self._cam0_intr)
+        self.get_logger().info(
+            f'cam0 CameraInfo: {msg.width}x{msg.height}  '
+            f'fx={msg.k[0]:.2f} fy={msg.k[4]:.2f} '
+            f'cx={msg.k[2]:.2f} cy={msg.k[5]:.2f}'
+        )
+
+    def _cam1_info_cb(self, msg: CameraInfo):
+        if self._cam1_info_received:
+            return
+        self._cam1_intr.update({
+            'fx': float(msg.k[0]), 'fy': float(msg.k[4]),
+            'cx': float(msg.k[2]), 'cy': float(msg.k[5]),
+            'img_w': int(msg.width), 'img_h': int(msg.height),
+        })
+        self._cam1_info_received = True
+        self._tracker1 = CameraTracker('cam1', self._cam1_intr)
+        self.get_logger().info(
+            f'cam1 CameraInfo: {msg.width}x{msg.height}  '
+            f'fx={msg.k[0]:.2f} fy={msg.k[4]:.2f} '
+            f'cx={msg.k[2]:.2f} cy={msg.k[5]:.2f}'
+        )
 
     # ── IMU propagation (identical to Step 9) ─────────────────────────────────
 
@@ -609,8 +648,10 @@ class MultiCamMsckfVio(Node):
 
             self._static_buf.append((am.copy(), wm.copy()))
 
-            if self._last_imu_t is not None and (t - self._last_imu_t +
-                    len(self._static_buf) / 250.0) >= self._static_init_dur:
+            if self._static_start_t is None:
+                self._static_start_t = t
+            elapsed = t - self._static_start_t
+            if elapsed >= self._static_init_dur:
                 am_mean = np.mean([s[0] for s in self._static_buf], axis=0)
                 wm_mean = np.mean([s[1] for s in self._static_buf], axis=0)
                 R0 = self._state.rotation_matrix()
@@ -620,7 +661,7 @@ class MultiCamMsckfVio(Node):
                 self._state.is_init = True
                 rpy = Rotation.from_quat(self._state.q).as_euler('xyz', degrees=True)
                 self.get_logger().info(
-                    f'Static init done ({len(self._static_buf)} samples)  '
+                    f'Static init done ({len(self._static_buf)} samples over {elapsed:.2f}s)  '
                     f'roll={rpy[0]:.1f}°  pitch={rpy[1]:.1f}°  yaw={rpy[2]:.1f}°  '
                     f'b_a=[{self._state.b_a[0]:.3f},{self._state.b_a[1]:.3f},{self._state.b_a[2]:.3f}]  '
                     f'b_g=[{self._state.b_g[0]:.4f},{self._state.b_g[1]:.4f},{self._state.b_g[2]:.4f}]')
@@ -667,7 +708,7 @@ class MultiCamMsckfVio(Node):
         G[6:9,  0:3]   = -np.eye(3)
         G[9:12, 6:9]   = np.eye(3)
         G[12:15, 9:12] = np.eye(3)
-        Q_d = G @ (self._Q_c / dt) @ G.T * dt
+        Q_d = G @ self._Q_c @ G.T * dt
 
         n, n_I = s.n, s.IMU_DIM
         n_C    = n - n_I
@@ -697,7 +738,7 @@ class MultiCamMsckfVio(Node):
           6. EKF batch update
           7. Marginalize oldest pair if window full
         """
-        if not self._state.is_init:
+        if not self._state.is_init or not self._cam0_info_received or not self._cam1_info_received:
             return
 
         # 1. Decode
@@ -891,14 +932,23 @@ class MultiCamMsckfVio(Node):
     def _decode(self, msg: Image):
         try:
             arr = np.frombuffer(msg.data, dtype=np.uint8)
-            img = arr.reshape(msg.height, msg.width, -1)
-            return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            enc = msg.encoding.lower()
+            if enc in ('mono8', '8uc1'):
+                return arr.reshape(msg.height, msg.width)
+            elif enc in ('bgr8', 'bgra8'):
+                channels = 4 if enc == 'bgra8' else 3
+                img = arr.reshape(msg.height, msg.width, channels)
+                return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            elif enc in ('rgb8', 'rgba8'):
+                channels = 4 if enc == 'rgba8' else 3
+                img = arr.reshape(msg.height, msg.width, channels)
+                return cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+            else:
+                # Unknown encoding: try 3-channel BGR then mono fallback
+                img = arr.reshape(msg.height, msg.width, -1)
+                return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
         except Exception:
-            try:
-                return np.frombuffer(msg.data, dtype=np.uint8).reshape(
-                    msg.height, msg.width)
-            except Exception:
-                return None
+            return None
 
     def _gt_cb(self, msg: VehicleLocalPosition):
         pos = np.array([msg.x, msg.y, msg.z])
@@ -921,6 +971,10 @@ class MultiCamMsckfVio(Node):
         odom.pose.pose.orientation.y = float(s.q[1])
         odom.pose.pose.orientation.z = float(s.q[2])
         odom.pose.pose.orientation.w = float(s.q[3])
+        # Map [p(0:3), φ(6:9)] from 15-dim state to 6×6 ROS covariance [x,y,z,rx,ry,rz]
+        pose_idx = [0, 1, 2, 6, 7, 8]
+        P6 = s.P[np.ix_(pose_idx, pose_idx)]
+        odom.pose.covariance = P6.flatten().tolist()
         self._pub_odom.publish(odom)
 
         pose = PoseStamped()
@@ -928,6 +982,8 @@ class MultiCamMsckfVio(Node):
         pose.pose   = odom.pose.pose
         self._path_msg.header.stamp = stamp
         self._path_msg.poses.append(pose)
+        if len(self._path_msg.poses) > 2000:
+            self._path_msg.poses.pop(0)
         self._pub_path.publish(self._path_msg)
 
     def _status_cb(self):
@@ -939,6 +995,8 @@ class MultiCamMsckfVio(Node):
                    if self._gt_pos is not None else '')
         self.get_logger().info(
             f'[{elapsed:.0f}s]  '
+            f'cam0_info: {"yes" if self._cam0_info_received else "no"}  '
+            f'cam1_info: {"yes" if self._cam1_info_received else "no"}  '
             f'Updates:{self._update_count}  '
             f'Stereo:{self._stereo_feats}  Mono:{self._mono_feats}  '
             f'CamStates:{len(s.cam_states)}  '
@@ -956,7 +1014,8 @@ def main(args=None):
         pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
+        if rclpy.ok():
+            rclpy.shutdown()
 
 
 if __name__ == '__main__':
