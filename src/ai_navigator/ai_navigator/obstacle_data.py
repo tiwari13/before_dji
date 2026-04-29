@@ -2,7 +2,7 @@ import numpy as np
 import math
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Tuple, Set
-from enum import Enum
+from enum import Enum, IntEnum
 import time
 from collections import deque, defaultdict
 import cv2
@@ -27,7 +27,7 @@ class SensorType(Enum):
     RADAR = "RADAR"
     THERMAL = "THERMAL"
 
-class ThreatLevel(Enum):
+class ThreatLevel(IntEnum):
     """Threat assessment levels"""
     NONE = 0
     LOW = 1

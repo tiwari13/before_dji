@@ -255,7 +255,7 @@ def _signal_handler(signum, frame):
     print(f"\nReceived signal {signum} — shutting down")
     _shutdown_event.set()
     if _executor is not None:
-        _executor.shutdown(wait=False)
+        _executor.shutdown()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -469,7 +469,7 @@ Examples:
 
         if _executor is not None:
             try:
-                _executor.shutdown(wait=False)
+                _executor.shutdown()
             except Exception as e:
                 print(f"Executor shutdown error: {e}")
 
