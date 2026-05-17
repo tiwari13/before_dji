@@ -1,0 +1,160 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  x500_oakd_pro_w_front
+  x500 quadcopter with one forward-facing OAK-D Pro W camera.
+
+  Sensors on this model:
+    - cam_front_left   : 640x480 mono, 10 Hz  (stereo left, VIO)
+    - cam_front_right  : 640x480 mono, 10 Hz  (stereo right, VIO)
+    - cam_front_rgb    : 640x480 color, 10 Hz (detection / visualization)
+    - cam_front_imu    : 500 Hz IMU rigidly attached to camera body
+
+  ROS topics (via camera_bridge.yaml):
+    /cam_front/left/image_raw          sensor_msgs/Image
+    /cam_front/left/camera_info        sensor_msgs/CameraInfo
+    /cam_front/right/image_raw         sensor_msgs/Image
+    /cam_front/right/camera_info       sensor_msgs/CameraInfo
+    /cam_front/rgb/image_raw           sensor_msgs/Image
+    /cam_front/rgb/camera_info         sensor_msgs/CameraInfo
+    /cam_front/imu                     sensor_msgs/Imu
+    /imu/data                          sensor_msgs/Imu  (vehicle body IMU)
+
+  OAK-D Pro W specs used:
+    Stereo baseline  : 75 mm
+    Stereo FOV (H)   : 81 deg  = 1.4137 rad
+    RGB FOV (H)      : 95 deg  = 1.6581 rad
+    Stereo near/far  : 0.2 / 35 m (active stereo works to ~35 m)
+    RGB near/far     : 0.1 / 100 m
+
+  Camera mount:
+    x  =  0.15 m  (forward of centre)
+    y  =  0.00 m
+    z  =  0.10 m  (above arm plane)
+    roll/pitch/yaw = 0 (forward-facing, horizon level)
+
+  Stereo left/right offsets from camera centre (75 mm baseline):
+    left  : y = +0.0375 m
+    right : y = -0.0375 m
+-->
+<sdf version='1.9'>
+  <model name='x500_oakd_pro_w_front'>
+
+    <!-- ── Base x500 airframe ─────────────────────────────── -->
+    <include merge='true'>
+      <uri>x500</uri>
+    </include>
+
+    <!-- ── Camera body link ──────────────────────────────── -->
+    <link name='cam_front_body'>
+      <pose>.15 0 .10 0 0 0</pose>
+      <inertial>
+        <mass>0.072</mass>
+        <inertia>
+          <ixx>0.000060</ixx><ixy>0</ixy><ixz>0</ixz>
+          <iyy>0.000010</iyy><iyz>0</iyz>
+          <izz>0.000058</izz>
+        </inertia>
+      </inertial>
+      <collision name='cam_front_body_collision'>
+        <geometry>
+          <box><size>0.020 0.100 0.032</size></box>
+        </geometry>
+      </collision>
+      <visual name='cam_front_body_visual'>
+        <geometry>
+          <box><size>0.020 0.100 0.032</size></box>
+        </geometry>
+        <material>
+          <ambient>0.1 0.1 0.1 1</ambient>
+          <diffuse>0.1 0.1 0.1 1</diffuse>
+        </material>
+      </visual>
+
+      <!-- ── Stereo LEFT sensor (y = +37.5 mm) ─────────── -->
+      <sensor name='cam_front_left' type='camera'>
+        <gz_frame_id>cam_front_left_frame</gz_frame_id>
+        <pose>0 0.0375 0 0 0 0</pose>
+        <camera>
+          <horizontal_fov>1.4137</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>400</height>
+            <format>L8</format>
+          </image>
+          <clip><near>0.2</near><far>35.0</far></clip>
+        </camera>
+        <always_on>1</always_on>
+        <update_rate>10</update_rate>
+        <visualize>false</visualize>
+        <topic>/world/default/model/x500_oakd_pro_w_front_0/link/cam_front_body/sensor/cam_front_left/image</topic>
+      </sensor>
+
+      <!-- ── Stereo RIGHT sensor (y = -37.5 mm) ────────── -->
+      <sensor name='cam_front_right' type='camera'>
+        <gz_frame_id>cam_front_right_frame</gz_frame_id>
+        <pose>0 -0.0375 0 0 0 0</pose>
+        <camera>
+          <horizontal_fov>1.4137</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>400</height>
+            <format>L8</format>
+          </image>
+          <clip><near>0.2</near><far>35.0</far></clip>
+        </camera>
+        <always_on>1</always_on>
+        <update_rate>10</update_rate>
+        <visualize>false</visualize>
+        <topic>/world/default/model/x500_oakd_pro_w_front_0/link/cam_front_body/sensor/cam_front_right/image</topic>
+      </sensor>
+
+      <!-- ── RGB sensor (centre) ───────────────────────── -->
+      <sensor name='cam_front_rgb' type='camera'>
+        <gz_frame_id>cam_front_rgb_frame</gz_frame_id>
+        <pose>0 0 0 0 0 0</pose>
+        <camera>
+          <horizontal_fov>1.6581</horizontal_fov>
+          <image>
+            <width>640</width>
+            <height>400</height>
+            <format>RGB_INT8</format>
+          </image>
+          <clip><near>0.1</near><far>100.0</far></clip>
+        </camera>
+        <always_on>1</always_on>
+        <update_rate>10</update_rate>
+        <visualize>false</visualize>
+        <topic>/world/default/model/x500_oakd_pro_w_front_0/link/cam_front_body/sensor/cam_front_rgb/image</topic>
+      </sensor>
+
+      <!-- ── Camera-body IMU (500 Hz) ─────────────────── -->
+      <sensor name='cam_front_imu' type='imu'>
+        <gz_frame_id>cam_front_body</gz_frame_id>
+        <pose>0 0 0 0 0 0</pose>
+        <imu>
+          <angular_velocity>
+            <x><noise type='gaussian'><mean>0</mean><stddev>0.00018665</stddev></noise></x>
+            <y><noise type='gaussian'><mean>0</mean><stddev>0.00018665</stddev></noise></y>
+            <z><noise type='gaussian'><mean>0</mean><stddev>0.00018665</stddev></noise></z>
+          </angular_velocity>
+          <linear_acceleration>
+            <x><noise type='gaussian'><mean>0</mean><stddev>0.00186</stddev></noise></x>
+            <y><noise type='gaussian'><mean>0</mean><stddev>0.00186</stddev></noise></y>
+            <z><noise type='gaussian'><mean>0</mean><stddev>0.00186</stddev></noise></z>
+          </linear_acceleration>
+        </imu>
+        <always_on>1</always_on>
+        <update_rate>500</update_rate>
+        <topic>/world/default/model/x500_oakd_pro_w_front_0/link/cam_front_body/sensor/cam_front_imu/imu</topic>
+      </sensor>
+
+    </link>
+
+    <!-- ── Fixed joint: camera body → drone base ─────────── -->
+    <joint name='cam_front_joint' type='fixed'>
+      <parent>base_link</parent>
+      <child>cam_front_body</child>
+    </joint>
+
+  </model>
+</sdf>

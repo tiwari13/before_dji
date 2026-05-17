@@ -1,0 +1,11 @@
+#!/bin/sh
+#
+# @name Gazebo x500 OAK-D Pro W (forward)
+# @description x500 quadcopter with one forward-facing OAK-D Pro W stereo+RGB+IMU camera.
+#
+# @type Quadrotor
+#
+
+PX4_SIM_MODEL=${PX4_SIM_MODEL:=x500_oakd_pro_w_front}
+
+. ${R}etc/init.d-posix/airframes/4001_gz_x500

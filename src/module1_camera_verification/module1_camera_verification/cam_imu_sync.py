@@ -52,16 +52,13 @@ class CamIMUSync(Node):
         self.sync_pairs = deque(maxlen=2000)  # (cam_time, nearest_imu_time, offset)
 
         # ── Subscribers ────────────────────────────────────────
-        base_path = '/world/default/model/x500_skydio_0'
+        # Topics match camera_bridge_oakd_pro_w_front.yaml
+        cam_topic = '/cam_front/left/image_raw'
+        imu_topic = '/cam_front/imu'
 
-        # Front camera image
-        cam_topic = f'{base_path}/model/camera_front/link/camera_link/sensor/IMX214/image'
         self.cam_sub = self.create_subscription(
             Image, cam_topic, self.cam_callback, 10
         )
-
-        # IMU
-        imu_topic = f'{base_path}/link/base_link/sensor/imu_sensor/imu'
         self.imu_sub = self.create_subscription(
             Imu, imu_topic, self.imu_callback, 50
         )

@@ -1,0 +1,61 @@
+# ROS2-Gazebo bridge configuration for x500_oakd_pro_w_front
+#
+# Gazebo internal topic → clean ROS topic
+#
+# Model instance name: x500_oakd_pro_w_front_0
+# Run with:
+#   ros2 run ros_gz_bridge parameter_bridge \
+#     --ros-args -p config_file:=$HOME/ros2_ws/camera_bridge_oakd_pro_w_front.yaml
+
+# ── Stereo LEFT ──────────────────────────────────────────────────────────────
+- ros_topic_name: "/cam_front/left/image_raw"
+  gz_topic_name: "/world/default/model/x500_oakd_pro_w_front_0/link/cam_front_body/sensor/cam_front_left/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/cam_front/left/camera_info"
+  gz_topic_name: "/world/default/model/x500_oakd_pro_w_front_0/link/cam_front_body/sensor/cam_front_left/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+
+# ── Stereo RIGHT ─────────────────────────────────────────────────────────────
+- ros_topic_name: "/cam_front/right/image_raw"
+  gz_topic_name: "/world/default/model/x500_oakd_pro_w_front_0/link/cam_front_body/sensor/cam_front_right/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/cam_front/right/camera_info"
+  gz_topic_name: "/world/default/model/x500_oakd_pro_w_front_0/link/cam_front_body/sensor/cam_front_right/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+
+# ── RGB ──────────────────────────────────────────────────────────────────────
+- ros_topic_name: "/cam_front/rgb/image_raw"
+  gz_topic_name: "/world/default/model/x500_oakd_pro_w_front_0/link/cam_front_body/sensor/cam_front_rgb/image"
+  ros_type_name: "sensor_msgs/msg/Image"
+  gz_type_name: "gz.msgs.Image"
+  direction: GZ_TO_ROS
+
+- ros_topic_name: "/cam_front/rgb/camera_info"
+  gz_topic_name: "/world/default/model/x500_oakd_pro_w_front_0/link/cam_front_body/sensor/cam_front_rgb/camera_info"
+  ros_type_name: "sensor_msgs/msg/CameraInfo"
+  gz_type_name: "gz.msgs.CameraInfo"
+  direction: GZ_TO_ROS
+
+# ── Camera-body IMU (500 Hz) ─────────────────────────────────────────────────
+- ros_topic_name: "/cam_front/imu"
+  gz_topic_name: "/world/default/model/x500_oakd_pro_w_front_0/link/cam_front_body/sensor/cam_front_imu/imu"
+  ros_type_name: "sensor_msgs/msg/Imu"
+  gz_type_name: "gz.msgs.IMU"
+  direction: GZ_TO_ROS
+
+# ── Vehicle body IMU (250 Hz) ────────────────────────────────────────────────
+- ros_topic_name: "/imu/data"
+  gz_topic_name: "/world/default/model/x500_oakd_pro_w_front_0/link/base_link/sensor/imu_sensor/imu"
+  ros_type_name: "sensor_msgs/msg/Imu"
+  gz_type_name: "gz.msgs.IMU"
+  direction: GZ_TO_ROS
